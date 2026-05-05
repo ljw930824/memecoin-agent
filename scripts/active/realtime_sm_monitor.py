@@ -2172,7 +2172,15 @@ def process_new_trades(trades, state, wallets):
 
 
 
-            log(f'SM BUY: {sym} (buyers={len(act["buy_wallets"])}/{good_buyers}good, mcap=${mcap:,.0f})')
+            # trend entry filter (low weight - smart money primary)
+            trend_3m_entry = get_trend(ca, 180)
+            if trend_3m_entry < -0.08:  # 3min >8%/min crash = skip
+                log(f"SKIP {sym}: extreme dump (3min={trend_3m_entry:.1%}/min)")
+                continue
+            trend_tag = ''
+            if trend_3m_entry != 0:
+                trend_tag = f' trend={trend_3m_entry:+.1%}/min'
+            log(f'SM BUY: {sym} (buyers={len(act["buy_wallets"])}/{good_buyers}good, mcap=${mcap:,.0f}{trend_tag})')
 
 
             # risk control check
