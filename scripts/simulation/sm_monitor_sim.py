@@ -106,7 +106,15 @@ MIN_VOLUME = 500
 MAX_POSITIONS = 3
 
 
-BUY_SIZE_USDT = 5
+BUY_SIZE_USDT = 5          # default/fallback
+
+# === Position Sizing & Risk Control ===
+RISK_PCT = 0.01            # risk per trade (account x 1%)
+SL_PCT_BASE = 0.08         # base stop loss (8%)
+MAX_BUY_SIZE = 10.0        # max single buy (USD)
+MIN_BUY_SIZE = 3.0         # min single buy (USD)
+MAX_DAILY_LOSS_PCT = 0.05  # daily loss limit 5% -> stop trading
+MAX_MONTHLY_LOSS_PCT = 0.10  # monthly loss limit 10% -> pause 1 week
 
 
 SL_PCT = -0.08
@@ -355,6 +363,97 @@ TIME_TIERS = [
 
 
 # ===  ===
+
+
+def calc_buy_size(state):
+    """Dynamic position: risk_amount / |SL%| = (total x RISK_PCT) / SL_PCT_BASE"""
+    try:
+        sol_bal = get_balance('solana')
+        bsc_bal = get_balance('bsc')
+        usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
+        usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+        positions = state.get('positions', {})
+        pos_value = 0.0
+        for ca, p in positions.items():
+            ep = float(p.get('entry_price', 0) or 0)
+            bal = float(p.get('balance', 0) or 0)
+            pnl = float(p.get('pnl_pct', 0) or 0)
+            remaining = 1.0 - float(p.get('sold_pct', 0))
+            if ep > 0 and bal > 0:
+                pos_value += p.get('entry_usd_amount', BUY_SIZE_USDT) * remaining * (1 + pnl)
+        account_total = usdt_total + pos_value
+        if account_total <= 0:
+            return BUY_SIZE_USDT
+        risk_amount = account_total * RISK_PCT
+        size = risk_amount / SL_PCT_BASE
+        size = max(MIN_BUY_SIZE, min(MAX_BUY_SIZE, size))
+        log(f'position_size: account=${account_total:.2f} -> buy=${size:.2f} (risk={RISK_PCT:.0%})')
+        return round(size, 2)
+    except Exception as e:
+        log(f'calc_buy_size error: {e}')
+        return BUY_SIZE_USDT
+
+
+def check_risk_limits(state):
+    """Check daily/monthly loss limits, return (can_trade, reason)"""
+    now = int(time.time())
+    today_start = int(time.mktime(time.strptime(time.strftime('%Y-%m-%d'), '%Y-%m-%d')))
+    month_start = int(time.mktime(time.strptime(time.strftime('%Y-%m-01'), '%Y-%m-%d')))
+    pause_until = state.get('pause_until', 0)
+    if pause_until and now < pause_until:
+        from datetime import datetime
+        pu = datetime.fromtimestamp(pause_until).strftime('%m-%d %H:%M')
+        return False, f'monthly pause until {pu}'
+    realized_daily = 0.0
+    realized_monthly = 0.0
+    for t in state.get('trade_history', []):
+        exit_ts = t.get('exit_ts', 0)
+        exit_usd = t.get('exit_usd', 0)
+        entry_usd = t.get('entry_usd_amount', BUY_SIZE_USDT)
+        pnl_usd = exit_usd - entry_usd
+        if exit_ts >= month_start:
+            realized_monthly += pnl_usd
+        if exit_ts >= today_start:
+            realized_daily += pnl_usd
+    unrealized_daily = 0.0
+    unrealized_monthly = 0.0
+    for ca, p in state.get('positions', {}).items():
+        entry_ts = int(p.get('entry_ts', 0))
+        entry_usd = float(p.get('entry_usd_amount', BUY_SIZE_USDT))
+        pnl_pct = float(p.get('pnl_pct', 0) or 0)
+        remaining = 1.0 - float(p.get('sold_pct', 0))
+        unrealized_pnl = entry_usd * remaining * pnl_pct
+        unrealized_monthly += unrealized_pnl
+        if entry_ts >= today_start:
+            unrealized_daily += unrealized_pnl
+    try:
+        sol_bal = get_balance('solana')
+        bsc_bal = get_balance('bsc')
+        usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
+        usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+    except:
+        usdt_total = 50.0
+    pos_value = sum(
+        float(p.get('entry_usd_amount', BUY_SIZE_USDT)) * (1.0 - float(p.get('sold_pct', 0)))
+        for p in state.get('positions', {}).values()
+    )
+    account_total = max(usdt_total + pos_value, 1.0)
+    daily_pnl = realized_daily + unrealized_daily
+    daily_pct = daily_pnl / account_total
+    if daily_pct <= -MAX_DAILY_LOSS_PCT:
+        log(f'RISK BLOCK: daily PnL {daily_pct:+.1%} <= -{MAX_DAILY_LOSS_PCT:.0%} limit')
+        return False, f'daily loss {daily_pct:+.1%}'
+    monthly_pnl = realized_monthly + unrealized_monthly
+    monthly_pct = monthly_pnl / account_total
+    if monthly_pct <= -MAX_MONTHLY_LOSS_PCT:
+        from datetime import datetime, timedelta
+        pause_until = int((datetime.now() + timedelta(days=7)).timestamp())
+        state['pause_until'] = pause_until
+        pu = datetime.fromtimestamp(pause_until).strftime('%m-%d %H:%M')
+        log(f'RISK BLOCK: monthly PnL {monthly_pct:+.1%} <= -{MAX_MONTHLY_LOSS_PCT:.0%} -> pause until {pu}')
+        save_state(state)
+        return False, f'monthly loss {monthly_pct:+.1%}'
+    return True, 'ok'
 
 
 def log(msg):
@@ -2008,7 +2107,14 @@ def process_new_trades(trades, state, wallets):
             log(f'SM BUY: {sym} (buyers={len(act["buy_wallets"])}/{good_buyers}good, mcap=${mcap:,.0f})')
 
 
-            ok, tx = execute_buy(chain, ca, BUY_SIZE_USDT)
+            can_trade, risk_reason = check_risk_limits(state)
+            if not can_trade:
+                log(f'SKIP {sym}: risk blocked ({risk_reason})')
+                continue
+
+            dynamic_buy = calc_buy_size(state)
+
+            ok, tx = execute_buy(chain, ca, dynamic_buy)
 
 
             if ok:
@@ -2029,7 +2135,7 @@ def process_new_trades(trades, state, wallets):
                     'entry_price': entry_price,
 
 
-                    'entry_usd_amount': BUY_SIZE_USDT,
+                    'entry_usd_amount': dynamic_buy,
 
 
                     'last_update_ts': int(time.time()),
@@ -2751,6 +2857,12 @@ def run_once(state, wallets):
     if positions:
 
 
+        can_trade, reason = check_risk_limits(state)
+    risk_status = 'OK' if can_trade else f'BLOCKED({reason})'
+    log(f'Risk status: {risk_status}')
+
+    if positions:
+
         log(f'Open: {len(positions)}')
 
 
@@ -2797,6 +2909,8 @@ def main():
 
 
     log(f'=== SM Monitor v3.3 [{mode}] ===')
+    log(f'Risk: per-trade={RISK_PCT:.0%} of account, SL={SL_PCT_BASE:.0%}, daily_limit={MAX_DAILY_LOSS_PCT:.0%}, monthly_limit={MAX_MONTHLY_LOSS_PCT:.0%}')
+    log(f'Position: min=${MIN_BUY_SIZE}, max=${MAX_BUY_SIZE}')
 
 
 
