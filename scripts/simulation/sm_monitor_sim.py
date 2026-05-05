@@ -25,6 +25,7 @@ onchainos tracker activities REST
 
 
 
+import sys
 import json, sys, os, subprocess, re, time
 
 
@@ -736,7 +737,7 @@ def reconcile_wallet(state):
     try:
 
 
-        r = subprocess.run(['baw', 'wallet', 'balance', '--json'], capture_output=True, timeout=10, encoding='utf-8', errors='replace')
+        r = subprocess.run(['baw.cmd' if sys.platform == 'win32' else 'baw', 'wallet', 'balance', '--json'], capture_output=True, timeout=10, encoding='utf-8', errors='replace')
 
 
         if r.returncode == 0:
@@ -994,7 +995,7 @@ def baw_run(args, timeout=30):
     try:
 
 
-        r = subprocess.run(['baw'] + args, capture_output=True, timeout=timeout,
+        r = subprocess.run(['baw.cmd' if sys.platform == 'win32' else 'baw'] + args, capture_output=True, timeout=timeout,
 
 
                            encoding='utf-8', errors='replace')
