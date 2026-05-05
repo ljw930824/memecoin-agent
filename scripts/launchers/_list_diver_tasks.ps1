@@ -1,0 +1,1 @@
+Get-ScheduledTask | Where-Object {$_.TaskName -like '*diver*' -or $_.TaskName -like '*monitor*'} | Format-Table TaskName, State, TaskPath -AutoSize

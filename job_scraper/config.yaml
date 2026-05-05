@@ -1,0 +1,139 @@
+# ============================================================
+# 智能求职匹配系统 - 配置文件
+# ============================================================
+
+# 简历文件路径
+resume_path: resume/resume.pdf
+
+# ============================================================
+# LLM 配置 - 免费优先，付费兜底
+# ============================================================
+llm:
+  # 当前使用的provider
+  provider: "gemini"
+  model: "gemini-2.0-flash"
+  temperature: 0.1
+  max_tokens: 4096
+  timeout: 30
+
+  # Gemini (免费: 15 RPM, 100万tokens/月)
+  gemini:
+    api_key: ""  # 从 https://aistudio.google.com/apikey 获取
+    model: "gemini-2.0-flash"
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    rpm_limit: 15
+
+  # 智谱GLM-4 (免费试用额度)
+  zhipu:
+    api_key: ""  # 从 https://open.bigmodel.cn 获取
+    model: "glm-4-flash"
+    base_url: "https://open.bigmodel.cn/api/paas/v4/"
+
+  # 阿里通义千问 (免费额度)
+  qwen:
+    api_key: ""
+    model: "qwen-turbo"
+    base_url: "https://dashscope.aliyuncs.com/compatible/v1/"
+
+  # DeepSeek (便宜)
+  deepseek:
+    api_key: ""
+    model: "deepseek-chat"
+    base_url: "https://api.deepseek.com/v1/"
+
+  # 降级顺序: 免费 → 便宜 → 付费
+  fallback_chain: ["gemini", "zhipu", "qwen", "deepseek"]
+
+# ============================================================
+# 智能匹配权重
+# ============================================================
+scoring:
+  keyword_weight: 0.30    # 关键词匹配
+  semantic_weight: 0.40   # LLM语义理解
+  rule_weight: 0.30       # 规则引擎
+  auto_apply_threshold: 80  # ≥此分数自动标记为推荐
+  review_threshold: 60      # ≥此分数标记为待审核
+
+# ============================================================
+# 硬性筛选规则 (一票否决)
+# ============================================================
+filters:
+  # 薪资 (USD/年)
+  salary_min: 80000
+  salary_max: 350000
+
+  # 地点
+  allowed_locations: ["remote", "united states"]
+  blocked_locations: ["india", "china mainland"]
+
+  # 职位类型
+  blocked_titles: ["senior staff", "principal", "fellow", "intern", "contractor"]
+
+  # 公司
+  blocked_companies: []
+
+  # 经验 (年)
+  experience_min: 0
+  experience_max: 15
+
+  # 签证
+  require_visa_sponsorship: true
+
+  # 发布时间 (天)
+  max_posting_age_days: 14
+
+  # 安全许可
+  reject_security_clearance: true
+
+# ============================================================
+# Indeed 配置
+# ============================================================
+indeed:
+  enabled: true
+  base_url: "https://www.indeed.com"
+  max_pages: 20
+  results_per_page: 15
+  sort_by: "date"
+  request_delay: [3, 7]
+
+# ============================================================
+# LinkedIn 配置
+# ============================================================
+linkedin:
+  enabled: true
+  base_url: "https://www.linkedin.com"
+  max_pages: 10
+  results_per_page: 25
+  request_delay: [5, 12]
+  use_login: false
+  email: ""
+  password: ""
+
+# ============================================================
+# 搜索查询
+# ============================================================
+search_queries:
+  - query: "junior data scientist"
+    location: "United States"
+    site: "indeed"
+  - query: "junior data analyst"
+    location: "United States"
+    site: "indeed"
+  - query: "junior machine learning engineer"
+    location: "United States"
+    site: "indeed"
+  - query: "data scientist entry level"
+    location: "United States"
+    site: "linkedin"
+  - query: "data analyst new grad"
+    location: "United States"
+    site: "linkedin"
+
+# ============================================================
+# 输出
+# ============================================================
+output:
+  format: "json"
+  directory: "matched_jobs"
+  include_cover_letter: false
+  max_results: 100

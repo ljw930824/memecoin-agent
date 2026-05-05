@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "skills": {
+    "binance-agentic-wallet": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "2a2782de3db7f7e97a40371e50029d27bbcf67085b0dd9fa01aa59b7e2d7c13f"
+    },
+    "binance-tokenized-securities-info": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "6076f1e30aaae4817be002c9890133e6e58f70e0501e1e17d9c1a97e7efb319b"
+    },
+    "crypto-market-rank": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "dcc8678019b255b5ca90b4d3e62dde522bc6cc5222304b1a92c8ceee2c8c3a1f"
+    },
+    "meme-rush": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "772e675ee5566313c80b3ba74b7e9a1f5039b80eb1b7a39af42079e96a82504f"
+    },
+    "okx-agentic-wallet": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "d0242f36373d31898503662ec77f35a55be60f0d482cb73512171e8c08e3a207"
+    },
+    "okx-audit-log": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "4fc41f00ec222be37569fda35123fd37aecc0200f56e8174cd5b97b9110815ce"
+    },
+    "okx-cex-bot": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "6046fa2f556e915ad9c9f6140361b77c5a990755afb812ee2079802658f04268"
+    },
+    "okx-cex-earn": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "9c9de4ed110a349b1d2c8c82a52555cd2ff8cd708c6884b53234adb67a1338af"
+    },
+    "okx-cex-market": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "27edb4af5e1d4308909a39d7e34f9a99353f6594013c23d0a7f7a3455001dad0"
+    },
+    "okx-cex-portfolio": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "cc1ef0767bd3fc315bc99baa55657f60d50ce34b7ab3256091489db7335a09df"
+    },
+    "okx-cex-skill-mp": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "0de76bb49b424cace633116358384df830e7c239375835762cebc28d4d1eceee"
+    },
+    "okx-cex-trade": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "1cd2d177c748f1d280723699b9d8d682f8f670fd9cbf7923ce9f23dd41cc03ac"
+    },
+    "okx-defi-invest": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "bc25f16919b631b60844737a30345301fe14bfdf409333f36aec5328d04b2cbb"
+    },
+    "okx-defi-portfolio": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "f135c32b079f81662f8499b8da4b3d048a037b86ab52be8bd4a916dc7daecedf"
+    },
+    "okx-dex-market": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "c4354b3011e7d87ecabc1ed712007f8cd924fc8e0412f7e6b68151519c2edeba"
+    },
+    "okx-dex-signal": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "d162e8c259ffdf2097aae88bb04a6ef66d5e38a18ac8eeae9e5271e4c77c47e1"
+    },
+    "okx-dex-swap": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "b0e84c09d2d59cc339a31cf589923ec7f5d80628c1ed52971d8822bac92b3814"
+    },
+    "okx-dex-token": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "0b272cfdaa24f64623bea8df1e70fd9218fe7cdf03fd8faab68cbb567290b419"
+    },
+    "okx-dex-trenches": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "1e8196bb43478feb00bf0031ec10bca93369632263395268fae7873306face9d"
+    },
+    "okx-dex-ws": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "496ef563940045c56926b11fc337291bba925349ee9d2fb1b4d10b339bc57ec3"
+    },
+    "okx-onchain-gateway": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "ab609dd40a8cdd9f1d074ecc08207bda2a10c80bc29c6bbe84835e342aed71bb"
+    },
+    "okx-security": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "bee7b20c40543ea2d882f2a80004edb9e1e9d947ed15b83b2efb77cacd2231b2"
+    },
+    "okx-sentiment-tracker": {
+      "source": "okx/agent-skills",
+      "sourceType": "github",
+      "computedHash": "62b25288aa5172e846d6dcc8166c592d42319e0fa92abaeed05d3791cf9fae8c"
+    },
+    "okx-wallet-portfolio": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "202556fc4f67244c9029e7e8fde2a08ae02a04f9bd29d6549c6901052bd24df1"
+    },
+    "okx-x402-payment": {
+      "source": "okx/onchainos-skills",
+      "sourceType": "github",
+      "computedHash": "f6fd147ec02f3903896b412c3a2e85091e057e5d73569420fc110f93044ee063"
+    },
+    "query-address-info": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "c684ac9edaff7845c7a6369b757beb45a2bdf96918fab518c44e9c105b886fac"
+    },
+    "query-token-audit": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "1379ddaa0f173d2acfa273216337a2f217cafa309d534331dd37744394c00fb4"
+    },
+    "query-token-info": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "b4e57d82255392ba4d9ca57360f4b8dd719055ca12f2b97e6d48fa1f49c526c3"
+    },
+    "trading-signal": {
+      "source": "binance/binance-skills-hub",
+      "ref": "main",
+      "sourceType": "github",
+      "computedHash": "dcca8b0728bad09df707803d04a1d38e155b06a29b292cf42071bbe556c09d18"
+    }
+  }
+}

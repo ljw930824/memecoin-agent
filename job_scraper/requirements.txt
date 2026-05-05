@@ -1,0 +1,12 @@
+# 核心依赖
+pyyaml>=6.0
+beautifulsoup4>=4.12
+requests>=2.31
+openai>=1.0
+
+# 简历解析
+pymupdf>=1.24
+python-docx>=1.1
+
+# 浏览器自动化 (可选，LinkedIn需要)
+# playwright>=1.40
