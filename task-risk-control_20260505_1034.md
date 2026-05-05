@@ -1,26 +1,33 @@
-# 头寸管理 & 总风险控制
+# Dynamic Position Sizing and Risk Control
 
-**时间**: 2026-05-05 10:34
-**目标**: 添加动态仓位计算和日/月亏损限制到实时监控脚本
+Time: 2026-05-05 10:45
+Goal: Dynamic position sizing + risk-adjusted trading for memecoin monitor
 
-## 实现内容
+## Changes Applied
 
-### 新增常量
-RISK_PCT = 0.01 (单笔风险系数 账户总资金 x 1%)
-SL_PCT_BASE = 0.08 (基础止损幅度 8%)
-MAX_BUY_SIZE = 10.0 (单笔最大买入 USD)
-MIN_BUY_SIZE = 3.0 (单笔最小买入 USD)
-MAX_DAILY_LOSS_PCT = 0.05 (日亏损上限 5%)
-MAX_MONTHLY_LOSS_PCT = 0.10 (月亏损上限 10%)
+### Constants
+- RISK_PCT: 1% -> 2% (standard level)
+- MAX_BUY_SIZE:  -> 
+- RISK_TIERS: automatic reduction on daily loss
+  - daily loss > 2% -> reduce to 1.5%
+  - daily loss > 3.5% -> reduce to 1%
+- MAX_DAILY_LOSS_PCT: 5% (stop trading)
+- MAX_MONTHLY_LOSS_PCT: 10% (pause 1 week)
 
-### 新增函数
-calc_buy_size(state): 动态仓位 = (USDT余额 + 持仓价值) x 1% / 8%，范围 -
-check_risk_limits(state): 日亏>=5%拒绝开仓，月亏>=10%暂停7天
+### New Functions
+1. get_effective_risk(state): Calculates daily realized + unrealized PnL percentage, returns adjusted risk factor
+2. calc_buy_size(state): Uses effective risk to determine position size = account_total x effective_risk / 8%
+3. check_risk_limits(state): Daily/monthly loss enforcement with pause_until persistence
 
-### 买入流程改动
-check_risk_limits -> blocked? skip -> calc_buy_size -> execute_buy(chain, ca, dynamic_buy)
+### Key Design
+- Start aggressive (2% risk), auto-shrink on losses
+- Position = (USDT + position_value) x 2% / 8% = 25% of account (capped -)
+- Example:  account -> .5 buy,  account ->  (capped)
+- At -2% daily: risk drops to 1.5%, smaller positions
+- At -3.5% daily: risk drops to 1%, conservative
+- At -5% daily: stop trading entirely
 
-### 修改文件
-- scripts/active/realtime_sm_monitor.py (5 changes)
-- scripts/simulation/sm_monitor_sim.py (6 changes)
-- Both: syntax PASS
+### Files Modified
+- scripts/active/realtime_sm_monitor.py (48 lines added)
+- scripts/simulation/sm_monitor_sim.py (48 lines added)
+- Both: syntax PASS, committed 2d5446f, pushed to GitHub
