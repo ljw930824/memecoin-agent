@@ -111,12 +111,19 @@ MAX_POSITIONS = 3
 BUY_SIZE_USDT = 5          # 默认/兜底单笔金额
 
 # === 头寸管理 & 风险控制 ===
-RISK_PCT = 0.01            # 单笔风险系数 (账户总资金 x 1%)
+RISK_PCT = 0.02            # 单笔风险系数 (账户总资金 x 1%)
 SL_PCT_BASE = 0.08         # 基础止损幅度 (8%)
-MAX_BUY_SIZE = 10.0        # 单笔最大买入 (USD)
+MAX_BUY_SIZE = 15.0        # 单笔最大买入 (USD)
 MIN_BUY_SIZE = 3.0         # 单笔最小买入 (USD)
 MAX_DAILY_LOSS_PCT = 0.05  # 日亏损上限 5% -> 当天停交易
 MAX_MONTHLY_LOSS_PCT = 0.10  # 月亏损上限 10% -> 暂停一周
+
+# Dynamic risk tiers: reduce RISK_PCT when daily loss accumulates
+RISK_TIERS = [
+    (0.02, 0.015),  # daily loss > 2% -> reduce to 1.5%
+    (0.035, 0.01),  # daily loss > 3.5% -> reduce to 1%
+]
+BASE_RISK_PCT = RISK_PCT
 
 
 SL_PCT = -0.08
@@ -365,6 +372,38 @@ TIME_TIERS = [
 # ===  ===
 
 
+def get_effective_risk(state):
+    """Dynamic risk: reduce when daily loss accumulates"""
+    from datetime import datetime
+    today_start = int(time.mktime(time.strptime(time.strftime('%Y-%m-%d'), '%Y-%m-%d')))
+    realized_daily = 0.0
+    for t in state.get('trade_history', []):
+        if t.get('exit_ts', 0) >= today_start:
+            realized_daily += t.get('exit_usd', 0) - t.get('entry_usd_amount', BUY_SIZE_USDT)
+    unrealized_daily = 0.0
+    for ca, p in state.get('positions', {}).items():
+        if int(p.get('entry_ts', 0)) >= today_start:
+            entry_usd = float(p.get('entry_usd_amount', BUY_SIZE_USDT))
+            pnl_pct = float(p.get('pnl_pct', 0) or 0)
+            remaining = 1.0 - float(p.get('sold_pct', 0))
+            unrealized_daily += entry_usd * remaining * pnl_pct
+    try:
+        sol_bal = get_balance('solana')
+        bsc_bal = get_balance('bsc')
+        usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
+        usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+    except:
+        usdt_total = 50.0
+    account_total = max(usdt_total, 1.0)
+    daily_pct = (realized_daily + unrealized_daily) / account_total
+    effective = BASE_RISK_PCT
+    for threshold, reduced in RISK_TIERS:
+        if daily_pct <= -threshold:
+            effective = reduced
+    if effective != BASE_RISK_PCT:
+        log(f'Dynamic risk: {BASE_RISK_PCT:.1%} -> {effective:.1%} (daily PnL {daily_pct:+.1%})')
+    return effective
+
 def calc_buy_size(state):
     """动态仓位: risk_amount / |SL%| = (total x RISK_PCT) / SL_PCT_BASE"""
     try:
@@ -389,10 +428,11 @@ def calc_buy_size(state):
         if account_total <= 0:
             return BUY_SIZE_USDT  # fallback
 
-        risk_amount = account_total * RISK_PCT
+        effective_risk = get_effective_risk(state)
+        risk_amount = account_total * effective_risk
         size = risk_amount / SL_PCT_BASE
         size = max(MIN_BUY_SIZE, min(MAX_BUY_SIZE, size))
-        log(f'position_size: account=${account_total:.2f} -> buy=${size:.2f} (risk={RISK_PCT:.0%})')
+        log(f'position_size: account=${account_total:.2f} -> buy=${size:.2f} (risk={effective_risk:.1%})')
         return round(size, 2)
     except Exception as e:
         log(f'calc_buy_size error: {e}')
