@@ -18,11 +18,16 @@ def main():
     print(f"# SCALPER ORCHESTRATOR  |  Execute Only (no scan)")
     print(f"# {'='*56}")
 
-    # 1. BSC execution
+    # 1. BSC execution (isolated — Solana still runs if BSC raises)
     print(f"\n{'='*60}")
     print(f" Running: BSC Trader")
     print(f"{'='*60}")
-    rc_bsc = execute_bsc.main()
+    rc_bsc = 1
+    try:
+        rc_bsc = execute_bsc.main()
+    except Exception as e:
+        print(f"  [ERROR] BSC trader crashed: {e!r}")
+        rc_bsc = 1
     print(f"  Exit code: {rc_bsc}")
 
     # 2. Solana execution

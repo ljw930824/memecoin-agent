@@ -13,6 +13,17 @@ from datetime import datetime, timezone, timedelta
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from qclaw_trading_common import (
+    locked_read_json,
+    locked_write_json,
+    telegram_env,
+    dynamic_sl_tp_from_safety,
+)
+
 DATA_DIR    = os.path.expanduser("~/.qclaw/workspace/data")
 STATE_FILE  = os.path.join(DATA_DIR, "smart-money-state.json")
 QUEUE_FILE  = os.path.join(DATA_DIR, "signal-queue.json")
@@ -53,10 +64,10 @@ BREAKEVEN_TRIGGER       = 0.05   # Move SL to breakeven when +5%+
 # ═══════════════════════════════════════════════════════════════
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"positions": {}, "cooldowns": {}, "last_signal_ids": []}
+    return locked_read_json(
+        STATE_FILE,
+        {"positions": {}, "cooldowns": {}, "last_signal_ids": []},
+    )
 
 
 def backup_state():
@@ -67,16 +78,12 @@ def backup_state():
 
 
 def save_state(state):
-    backup_state()
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    locked_write_json(STATE_FILE, state, before_write=backup_state)
 
 
-# ─── Telegram Alert ───
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8781701155:AAGdKt0oZm5bfaEY39ItcGkiW4phMfYkfbI")
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "821225400")
-
+# ─── Telegram Alert (credentials from environment only) ───
 def notify_telegram(msg):
+    TG_BOT_TOKEN, TG_CHAT_ID = telegram_env()
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     try:
@@ -167,12 +174,14 @@ def get_current_price(ca):
     return 0
 
 
-def get_sl_price(entry_price):
-    return round(entry_price * (1 + STOP_LOSS_PCT), 10)
+def get_sl_price(entry_price, sl_pct=None):
+    pct = STOP_LOSS_PCT if sl_pct is None else float(sl_pct)
+    return round(entry_price * (1 + pct), 10)
 
 
-def get_tp_price(entry_price):
-    return round(entry_price * (1 + TAKE_PROFIT_PCT), 10)
+def get_tp_price(entry_price, tp_pct=None):
+    pct = TAKE_PROFIT_PCT if tp_pct is None else float(tp_pct)
+    return round(entry_price * (1 + pct), 10)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -210,7 +219,10 @@ def _query_usdt_balance():
 
 
 def buy_token(ca, ticker, amount_usdt, entry_price, score, reasons, sig_id):
-    """Execute buy on BSC via BAW market-order swap."""
+    """Execute buy on BSC via BAW market-order swap.
+    Returns (success, payload_or_err, amount_tokens, sl_pct, tp_pct, invest_usd).
+    On failure invest_usd=0.0."""
+    sl_dyn, tp_dyn = STOP_LOSS_PCT, TAKE_PROFIT_PCT
     print(f"\n  >> BUY {ticker} | ${amount_usdt:.2f} @ {entry_price:.10f}")
     # Pre-flight safety check
     try:
@@ -222,7 +234,11 @@ def buy_token(ca, ticker, amount_usdt, entry_price, score, reasons, sig_id):
             reason = s_errors[0] if s_errors else f'SCORE_{s_score}'
             print(f'     SAFETY CHECK FAILED: {reason} (score={s_score})')
             notify_telegram(f'⚠️ <b>{ticker} SAFETY FAIL</b>\nReason: {reason} | Score: {s_score}')
-            return False, reason, 0.0
+            return False, reason, 0.0, sl_dyn, tp_dyn, 0.0
+        imp = float((s_details or {}).get("price_impact", 0) or 0)
+        sl_dyn, tp_dyn, scale = dynamic_sl_tp_from_safety(s_score, imp, STOP_LOSS_PCT, TAKE_PROFIT_PCT)
+        amount_usdt = max(MIN_INVEST_USD, amount_usdt * scale)
+        print(f"     [RISK-TIER] impact={imp:.2f}% safety={s_score} -> scale={scale:.2f} SL={sl_dyn:.3f} TP={tp_dyn:.3f} invest=${amount_usdt:.2f}")
     except ImportError:
         pass
     for attempt in range(1, 4):
@@ -247,18 +263,18 @@ def buy_token(ca, ticker, amount_usdt, entry_price, score, reasons, sig_id):
                     actual_tokens = _query_token_balance(ca)
                     if actual_tokens > 0:
                         print(f"     Confirmed: {actual_tokens:.6f} {ticker}")
-                        return True, tx_hash, actual_tokens
+                        return True, tx_hash, actual_tokens, sl_dyn, tp_dyn, amount_usdt
                     else:
                         est = amount_usdt / entry_price if entry_price > 0 else 0
                         print(f"     Balance query failed — using estimate: {est:.6f}")
-                        return True, tx_hash, est
+                        return True, tx_hash, est, sl_dyn, tp_dyn, amount_usdt
             except Exception:
                 pass
         print(f"     Attempt {attempt} failed: {err or out[:100]}")
         log_retry(ticker, "BUY", err or "unknown", attempt)
         time.sleep(3 * attempt)  # Progressive backoff: 3s, 6s, 9s
     notify_telegram(f"🚨 <b>BSC BUY FAILED</b>\n{ticker}\n3 attempts exhausted. Manual intervention needed.")
-    return False, "", 0.0
+    return False, "", 0.0, sl_dyn, tp_dyn, 0.0
 
 
 def place_tp_limit_order(ca, ticker, amount_tokens, tp_price):
@@ -634,7 +650,10 @@ def check_and_close_position(ca):
             if success:
                 record_trade_close(ca, "SOLD_RATIO_EXIT", pnl_pct)
                 del state["positions"][ca]
-                state["cooldowns"][ca] = (now + timedelta(hours=COOLDOWN_SL)).isoformat()
+                _now = datetime.now(timezone(timedelta(hours=8)))
+                state["cooldowns"][ca] = (
+                    _now + timedelta(hours=COOLDOWN_AFTER_SL)
+                ).isoformat()
                 save_state(state)
                 return True
         elif sold_ratio >= 30:
@@ -748,11 +767,33 @@ def main():
     print(f" BSC Open Positions: {bsc_open}/{MAX_BSC_POSITIONS}")
 
     actions_taken = []
+    queue_snapshot = load_queue()
 
     # ─── 1. Check existing BSC positions ───
     print("\n[ Position Management ]")
     for ca, pos in list(bsc_positions.items()):
         ticker = pos.get("ticker", "?")
+        # Refresh soldRatio from latest queue (same CA; prefer BSC chain id 56)
+        sig_q = next(
+            (
+                q
+                for q in queue_snapshot
+                if q.get("ca", "").lower() == ca.lower() and str(q.get("chain")) == "56"
+            ),
+            None,
+        )
+        if not sig_q:
+            sig_q = next(
+                (q for q in queue_snapshot if q.get("ca", "").lower() == ca.lower()),
+                None,
+            )
+        if sig_q:
+            try:
+                pos["sold_ratio"] = float(
+                    sig_q.get("soldRatioPercent", pos.get("sold_ratio", 0))
+                )
+            except (TypeError, ValueError):
+                pass
         current_price = get_current_price(ca)
         if current_price <= 0:
             continue
@@ -847,7 +888,9 @@ def main():
                 print(f"     [SKIP] {ticker} - already in positions (fresh state)")
                 continue
 
-            success, tx, amount_tokens = buy_token(ca, ticker, invest, ep, score, reasons, _sig_id)
+            success, tx, amount_tokens, sl_pct, tp_pct, invest_used = buy_token(
+                ca, ticker, invest, ep, score, reasons, _sig_id
+            )
 
             if success:
                 # Immediately add to state to prevent duplicate buys in same cycle
@@ -855,8 +898,8 @@ def main():
                 save_state(state)
                 bsc_positions[ca] = {"temp": True, "ticker": ticker}
                 
-                tp_price = get_tp_price(ep)
-                sl_price = get_sl_price(ep)
+                tp_price = get_tp_price(ep, tp_pct)
+                sl_price = get_sl_price(ep, sl_pct)
                 # Wait for chain confirmation before placing TP limit order
                 time.sleep(3)
 
@@ -890,7 +933,7 @@ def main():
                     "ca": ca,
                     "entry_price": ep,
                     "amount": amount_tokens,
-                    "invest_amount": invest,
+                    "invest_amount": invest_used,
                     "sl_price": sl_price,
                     "tp_price": tp_price,
                     "pnl_pct": 0,
@@ -915,7 +958,7 @@ def main():
                 if len(state["last_signal_ids"]) > 50:
                     state["last_signal_ids"] = state["last_signal_ids"][-50:]
 
-                usdt_bal -= invest
+                usdt_bal -= invest_used
                 actions_taken.append(f"OPEN {ticker} @ {ep:.8f}")
                 save_state(state)
                 print(f"     Opened: {ticker} | invest=${invest:.2f} | SL={sl_price:.8f} | TP={tp_price:.8f} | LIMIT=OK")

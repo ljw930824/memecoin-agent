@@ -10,6 +10,16 @@ from datetime import datetime, timezone, timedelta
 
 sys.stdout.reconfigure(encoding='utf-8')
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from qclaw_trading_common import (
+    okx_env_for_subprocess,
+    canonical_chain_for_onchainos,
+    locked_write_json,
+)
+
 DATA_DIR = os.path.join(os.path.expanduser('~'), '.qclaw', 'workspace', 'data')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
 LOG_FILE = os.path.join(DATA_DIR, 'signal-log.txt')
@@ -35,6 +45,9 @@ OC_CHAINS = [
 BINANCE_CHAINS = [
     ('56', 'BSC'),
 ]
+
+# Tracker: smart-money BUY activities (faster than signal list); merged after list fetch
+TRACKER_MIN_VOL_USD = float(os.environ.get('TRACKER_MIN_VOL_USD', '400'))
 
 def parse_onchainos_json(raw):
     """Extract last valid JSON object from onchainos output (may have log lines)."""
@@ -189,21 +202,16 @@ def score_binance(sig):
 # ═══════════════════════════════════════════════
 # Fetch functions
 # ═══════════════════════════════════════════════
-_OKX_ENV = os.environ.copy()
-_OKX_ENV['OKX_PROD_API_KEY'] = _OKX_ENV.get('OKX_PROD_API_KEY') or _OKX_ENV.get('OKX_API_KEY', '***REMOVED***')
-_OKX_ENV['OKX_PROD_SECRET_KEY'] = _OKX_ENV.get('OKX_PROD_SECRET_KEY') or _OKX_ENV.get('OKX_SECRET_KEY', '***REMOVED***')
-_OKX_ENV['OKX_PROD_PASSPHRASE'] = _OKX_ENV.get('OKX_PROD_PASSPHRASE') or _OKX_ENV.get('OKX_PASSPHRASE', '***REMOVED***')
-_OKX_ENV['OKX_API_KEY'] = _OKX_ENV['OKX_PROD_API_KEY']
-_OKX_ENV['OKX_SECRET_KEY'] = _OKX_ENV['OKX_PROD_SECRET_KEY']
-_OKX_ENV['OKX_PASSPHRASE'] = _OKX_ENV['OKX_PROD_PASSPHRASE']
-
 def fetch_onchainos(chain_name, chain_display, limit=30):
     """Fetch signals from onchainos. Returns normalized signal list."""
+    _okx = okx_env_for_subprocess()
+    if not _okx:
+        return []
     try:
         r = subprocess.run(
             ['onchainos', 'signal', 'list', '--chain', chain_name, '--limit', str(limit), '--wallet-type', '1'],
             capture_output=True, text=True, timeout=20, encoding='utf-8',
-            env=_OKX_ENV
+            env=_okx
         )
         d = parse_onchainos_json(r.stdout)
         if not d or not d.get('ok'):
@@ -218,10 +226,12 @@ def fetch_onchainos(chain_name, chain_display, limit=30):
             if not ca:
                 continue
             score, reason = score_onchainos(s)
-            # Normalize to common format
+            canon = canonical_chain_for_onchainos(chain_name, s.get('chainIndex', ''))
+            # Normalize to common format (chain = canonical id for executors: CT_501, 56, …)
             normalized = {
                 'source': 'onchainos',
-                'chain': chain_name,
+                'chain': canon,
+                'chain_slug': chain_name,
                 'chain_name': chain_display,
                 'chainIndex': s.get('chainIndex', ''),
                 'ca': ca,
@@ -268,6 +278,7 @@ def fetch_binance(chain_id, chain_name):
                 normalized = {
                     'source': 'binance',
                     'chain': chain_id,
+                    'chain_slug': 'bsc',
                     'chain_name': chain_name,
                     'ca': s.get('contractAddress', ''),
                     'ticker': s.get('tokenSymbol', '?'),
@@ -294,6 +305,81 @@ def fetch_binance(chain_id, chain_name):
         return []
 
 
+def fetch_tracker_buy_signals():
+    """
+    Recent smart-money BUY trades (tracker activities) — fills gaps vs delayed signal list.
+    Returns normalized entries compatible with execute_* / monitor (canonical `chain`).
+    """
+    env = okx_env_for_subprocess()
+    if not env:
+        return []
+    out_rows = []
+    # (onchainos --chain name, canonical queue chain id)
+    chains = [('solana', 'CT_501'), ('bsc', '56')]
+    for cli_name, canon in chains:
+        try:
+            r = subprocess.run(
+                [
+                    'onchainos', 'tracker', 'activities',
+                    '--tracker-type', 'smart_money',
+                    '--chain', cli_name,
+                    '--min-volume', str(int(TRACKER_MIN_VOL_USD)),
+                ],
+                capture_output=True, text=True, timeout=25, encoding='utf-8',
+                env=env,
+            )
+            d = parse_onchainos_json(r.stdout)
+            if not d or not d.get('ok'):
+                continue
+            trades = d.get('data', {}).get('trades') or []
+            for t in trades:
+                if not isinstance(t, dict):
+                    continue
+                if str(t.get('tradeType', '')) != '1':
+                    continue
+                ca = (t.get('tokenContractAddress') or t.get('tokenAddress') or '').strip()
+                if not ca:
+                    continue
+                vol = float(
+                    t.get('amountUsd', 0)
+                    or t.get('volumeUsd', 0)
+                    or t.get('tradeAmountUsd', 0)
+                    or 0
+                )
+                if vol < TRACKER_MIN_VOL_USD:
+                    continue
+                sym = t.get('tokenSymbol', '?') or '?'
+                px = float(t.get('price', 0) or t.get('tokenPrice', 0) or 0)
+                boost = min(22, int(vol / 700))
+                sc = min(58, SCORE_THRESHOLD + 2 + boost)
+                sig_tail = str(t.get('tradeTime', t.get('id', '')))[-12:]
+                out_rows.append({
+                    'source': 'onchainos_tracker',
+                    'chain': canon,
+                    'chain_slug': cli_name,
+                    'chain_name': 'Solana' if cli_name == 'solana' else 'BSC',
+                    'chainIndex': '501' if canon == 'CT_501' else '56',
+                    'ca': ca,
+                    'ticker': sym,
+                    'tokenName': sym,
+                    'score': sc,
+                    'score_reason': 'TRACKER_BUY',
+                    'sigId': f"trk_{cli_name}_{ca[:8]}_{sig_tail}",
+                    'ts': time.time(),
+                    'currentPrice': px,
+                    'amountUsd': vol,
+                    'triggerWalletCount': 1,
+                    'soldRatioPercent': 0.0,
+                    'timestamp': int(t.get('tradeTime', 0) or 0),
+                    'marketCapUsd': 0.0,
+                    'holders': 0,
+                    'top10HolderPercent': 0.0,
+                })
+        except Exception:
+            continue
+    return out_rows
+
+
 # ═══════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════
@@ -317,12 +403,22 @@ def main():
             if ca and any(x.get('ca', '').lower() == ca for x in signals):
                 continue
             signals.append(s)
+
+    # 3. Tracker BUYs (not already in list — faster path for memecoin windows)
+    try:
+        seen = {s.get('ca', '').lower() for s in signals if s.get('ca')}
+        for row in fetch_tracker_buy_signals():
+            k = row.get('ca', '').lower()
+            if k and k not in seen:
+                signals.append(row)
+                seen.add(k)
+    except Exception:
+        pass
+
+    # 4. Write queue (atomic + lock)
+    locked_write_json(QUEUE_FILE, signals, indent=2)
     
-    # 3. Write queue
-    with open(QUEUE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(signals, f, indent=2, ensure_ascii=False)
-    
-    # 4. Stats
+    # 5. Stats
     qualified = [s for s in signals if s['score'] >= SCORE_THRESHOLD]
     sources = {}
     for s in signals:

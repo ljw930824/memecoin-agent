@@ -13,10 +13,29 @@ safety_check.py — 买入前安全检查模块（双链共享）
 推荐阈值: score >= 60 优先开仓
 """
 
-import json, subprocess, sys, time, os
+import json, subprocess, sys, time, os, re
 
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from qclaw_trading_common import okx_env_for_subprocess  # noqa: E402
+
+
+def _parse_json_loose(raw):
+    """onchainos may prefix log lines — extract last JSON object."""
+    if not raw or not isinstance(raw, str):
+        return None
+    m = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
 
 # ── 路径 ──
 ONCHAINOS = r'C:\Users\dell\.local\bin\onchainos.exe'
@@ -47,21 +66,14 @@ RECOMMEND_SCORE    = 60     # 推荐分
 # Solana: 通过 onchainos swap quote 获取审计数据
 # ═══════════════════════════════════════════════════════════════
 
-_OKX_ENV = os.environ.copy()
-_OKX_ENV['OKX_PROD_API_KEY'] = _OKX_ENV.get('OKX_PROD_API_KEY') or _OKX_ENV.get('OKX_API_KEY', '***REMOVED***')
-_OKX_ENV['OKX_PROD_SECRET_KEY'] = _OKX_ENV.get('OKX_PROD_SECRET_KEY') or _OKX_ENV.get('OKX_SECRET_KEY', '***REMOVED***')
-_OKX_ENV['OKX_PROD_PASSPHRASE'] = _OKX_ENV.get('OKX_PROD_PASSPHRASE') or _OKX_ENV.get('OKX_PASSPHRASE', '***REMOVED***')
-_OKX_ENV['OKX_API_KEY'] = _OKX_ENV['OKX_PROD_API_KEY']
-_OKX_ENV['OKX_SECRET_KEY'] = _OKX_ENV['OKX_PROD_SECRET_KEY']
-_OKX_ENV['OKX_PASSPHRASE'] = _OKX_ENV['OKX_PROD_PASSPHRASE']
-
 def _oc_run(args, timeout=30):
     cmd = [ONCHAINOS] + args
+    _env = okx_env_for_subprocess() or os.environ.copy()
     for attempt in range(3):
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=timeout, encoding='utf-8', errors='replace',
-                               env=_OKX_ENV)
+                               env=_env)
             if r.returncode == 0 and r.stdout.strip():
                 return r.stdout.strip(), r.stderr.strip(), 0
             if attempt < 2:
@@ -172,7 +184,7 @@ def check_solana(token_ca, trade_amount_usd=5.0):
         return 0, False, {}, ['quote_failed']
 
     try:
-        d = json.loads(out)
+        d = _parse_json_loose(out) or json.loads(out)
         if not (d.get('ok') and d.get('data')):
             return 0, False, {}, ['no_quote_data']
 
@@ -199,6 +211,8 @@ def check_solana(token_ca, trade_amount_usd=5.0):
             est_liq = to_amt * to_price
         else:
             est_liq = from_amt * len(routers) * 50
+        if est_liq != est_liq or est_liq < 0:
+            est_liq = 0.0
 
         # DEX 路由数作为辅助指标
         dex_count = len(routers)

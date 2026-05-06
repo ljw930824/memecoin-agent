@@ -5,6 +5,19 @@ from datetime import datetime, timezone, timedelta
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from qclaw_trading_common import (  # noqa: E402
+    locked_read_json,
+    locked_write_json,
+    okx_env_for_subprocess,
+    signal_chain_is_solana,
+    telegram_env,
+    dynamic_sl_tp_from_safety,
+)
+
 DATA_DIR   = os.path.expanduser('~/.qclaw/workspace/data')
 STATE_FILE = os.path.join(DATA_DIR, 'smart-money-state.json')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
@@ -28,23 +41,21 @@ COOLDOWN_TP    = 6
 MAX_DAILY_LOSS_PCT      = 0.15   # Max daily drawdown -15%
 CONSECUTIVE_SL_FREEZE   = 3      # 3 consecutive SL -> freeze trading
 FREEZE_DURATION_HOURS   = 2      # Freeze duration
-TG_TOKEN   = os.environ.get('TG_BOT_TOKEN', '8781701155:AAGdKt0oZm5bfaEY39ItcGkiW4phMfYkfbI')
-TG_CHAT_ID = os.environ.get('TG_CHAT_ID', '821225400')
-
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {'positions': {}, 'cooldowns': {}, 'last_signal_ids': []}
+    return locked_read_json(
+        STATE_FILE,
+        {'positions': {}, 'cooldowns': {}, 'last_signal_ids': []},
+    )
 
 def save_state(s):
     import shutil
-    if os.path.exists(STATE_FILE):
-        shutil.copy2(STATE_FILE, STATE_FILE.replace('.json', '_bak.json'))
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(s, f, indent=2, ensure_ascii=False)
+    def _bak():
+        if os.path.exists(STATE_FILE):
+            shutil.copy2(STATE_FILE, STATE_FILE.replace('.json', '_bak.json'))
+    locked_write_json(STATE_FILE, s, before_write=_bak)
 
 def notify(msg):
+    TG_TOKEN, TG_CHAT_ID = telegram_env()
     if not TG_TOKEN:
         return
     try:
@@ -79,13 +90,7 @@ def log_retry(ticker, action, reason, attempt):
 def is_pumpfun_address(ca):
     return False
 
-OKX_ENV = os.environ.copy()
-OKX_ENV['OKX_PROD_API_KEY'] = OKX_ENV.get('OKX_PROD_API_KEY') or OKX_ENV.get('OKX_API_KEY', '***REMOVED***')
-OKX_ENV['OKX_PROD_SECRET_KEY'] = OKX_ENV.get('OKX_PROD_SECRET_KEY') or OKX_ENV.get('OKX_SECRET_KEY', '***REMOVED***')
-OKX_ENV['OKX_PROD_PASSPHRASE'] = OKX_ENV.get('OKX_PROD_PASSPHRASE') or OKX_ENV.get('OKX_PASSPHRASE', '***REMOVED***')
-OKX_ENV['OKX_API_KEY'] = OKX_ENV['OKX_PROD_API_KEY']
-OKX_ENV['OKX_SECRET_KEY'] = OKX_ENV['OKX_PROD_SECRET_KEY']
-OKX_ENV['OKX_PASSPHRASE'] = OKX_ENV['OKX_PROD_PASSPHRASE']
+OKX_ENV = okx_env_for_subprocess() or os.environ.copy()
 
 def ocoin_run(args, timeout=90, retries=1):
     """Run onchainos command with optional retry on failure."""
@@ -291,54 +296,59 @@ def swap_execute_raw(from_token, to_token, amount_raw, chain='Solana', slippage=
         return False, err or out[:100]
 
 def preflight_safety_check(ca, ticker, invest_usdt):
-    """Return (ok, reason, score) tuple. ok=True means safe to buy."""
+    """Return (ok, reason, score, price_impact_pct). ok=True means safe to buy."""
     try:
         from safety_check import check_solana, format_safety_report
         score, passed, details, errors = check_solana(ca, invest_usdt)
         report = format_safety_report(score, passed, details, errors)
         print('     ' + report.replace('\n', '\n     '))
+        impact = float((details or {}).get('price_impact', 0) or 0)
         if not passed:
             reason = errors[0] if errors else f'SCORE_{score}'
-            return False, reason, score
-        return True, '', score
+            return False, reason, score, impact
+        return True, '', score, impact
     except ImportError:
         # fallback: 基础检查
         out, err, code = ocoin_run(['swap', 'quote', '--chain', 'Solana',
             '--from', SOL_USDT, '--to', ca, '--readable-amount', str(min(invest_usdt, 1.0))], timeout=30)
         if code != 0:
-            return False, 'quote_failed', 0
+            return False, 'quote_failed', 0, 0.0
         try:
             d = json.loads(out)
             data = d['data'][0]
             to_token = data.get('toToken', {})
             if to_token.get('isHoneyPot', False):
-                return False, 'HONEYPOT', 0
+                return False, 'HONEYPOT', 0, 0.0
             tax = float(to_token.get('taxRate', 0) or 0)
             if tax > 10.0:
-                return False, f'TAX_{tax}%', 0
-            return True, '', 50
+                return False, f'TAX_{tax}%', 0, 0.0
+            imp = float(data.get('priceImpactPercent', 0) or 0)
+            return True, '', 50, imp
         except Exception:
-            return False, 'exception', 0
+            return False, 'exception', 0, 0.0
 
 def buy_token(ca, ticker, amount_usdt, entry_price):
     print('')
     print('  >> BUY ' + ticker + ' | $' + str(round(amount_usdt, 2)) + ' on Solana')
-    safe, reason, score = preflight_safety_check(ca, ticker, amount_usdt)
+    safe, reason, score, impact = preflight_safety_check(ca, ticker, amount_usdt)
     if not safe:
         print('     SAFETY CHECK FAILED: ' + reason + ' (score=' + str(score) + ')')
         notify('&#x26A0; <b>' + ticker + ' SAFETY FAIL</b>\nReason: ' + reason + ' | Score: ' + str(score))
-        return False, reason
-    print('     Safety OK (score=' + str(score) + ')')
+        return False, reason, None
+    sl_pct, tp_pct, scale = dynamic_sl_tp_from_safety(score, impact, STOP_LOSS_PCT, TAKE_PROFIT_PCT)
+    amount_usdt = max(MIN_INVEST_USD, amount_usdt * scale)
+    print('     Safety OK (score=' + str(score) + ') | tier SL=' + str(sl_pct) + ' TP=' + str(tp_pct) + ' invest=$' + str(round(amount_usdt, 2)))
+    meta = {'sl_pct': sl_pct, 'tp_pct': tp_pct, 'invest': amount_usdt}
     for attempt in range(1, 4):
         success, tx = swap_execute(SOL_USDT, ca, amount_usdt)
         if success:
             print('     SUCCESS | TX: ' + tx)
-            return True, tx
+            return True, tx, meta
         print('     Attempt ' + str(attempt) + ' failed: ' + tx)
         log_retry(ticker, 'BUY', tx, attempt)
         time.sleep(8)
     notify('&#x1F6A8; <b>Solana BUY FAILED</b>\n' + ticker + '\n3 attempts exhausted. Signal missed.')
-    return False, ''
+    return False, '', None
 
 def sell_token(ca, ticker, pct=1.0, reason=''):
     bal, raw_bal, dec = get_token_balance(ca)
@@ -444,11 +454,13 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
             if success:
                 pos['partial_tp_10'] = True
                 pos['sl_price'] = max(float(pos['sl_price']), ep)
+                pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
     if pnl_pct >= 0.15 and not pos.get('partial_tp_15'):
         success, _ = sell_token(ca, ticker, 0.5, 'PARTIAL_TP15')
         if success:
             pos['partial_tp_15'] = True
             pos['sl_price'] = max(float(pos['sl_price']), ep * 1.03)
+            pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
     if pnl_pct >= 0.08 and not pos.get('breakeven_done'):
         pos['sl_price'] = max(float(pos['sl_price']), ep)
         pos['breakeven_done'] = True
@@ -561,7 +573,7 @@ def monitor_signal_decay(ca, ticker, entry_price, score, sig_id,
                 queue = json.load(f)
         sig = next((s for s in queue
                     if s.get('ca', '').lower() == ca.lower()
-                    and s.get('chain') == 'CT_501'), None)
+                    and signal_chain_is_solana(s)), None)
         current_score = sig['score'] if sig else None
         current_price = sig['currentPrice'] if sig else 0
         if not current_price or current_price <= 0:
@@ -653,7 +665,12 @@ def main():
         ticker = pos.get('ticker', '?')
         sig = next((s for s in queue
                     if s.get('ca', '').lower() == ca.lower()
-                    and s.get('chain') == 'CT_501'), None)
+                    and signal_chain_is_solana(s)), None)
+        if sig:
+            try:
+                pos['sold_ratio'] = float(sig.get('soldRatioPercent', pos.get('sold_ratio', 0)))
+            except (TypeError, ValueError):
+                pass
         current_price = get_price_usd(ca) if not (sig and sig.get('currentPrice')) else sig['currentPrice']
         if current_price <= 0:
             current_price = pos.get('current_price', 0)
@@ -664,7 +681,7 @@ def main():
     if sol_open < MAX_POSITIONS and usdt_bal >= MIN_INVEST_USD:
         print('')
         print('[ Signals ]')
-        signals = sorted([s for s in queue if s.get('chain') == 'CT_501'],
+        signals = sorted([s for s in queue if signal_chain_is_solana(s)],
                         key=lambda x: x.get('score', 0), reverse=True)
         for sig in signals:
             if usdt_bal < MIN_INVEST_USD or sol_open >= MAX_POSITIONS:
@@ -699,19 +716,26 @@ def main():
             if to_amt2 <= 0:
                 print('      No quote at $' + str(round(invest,2)) + ', skipping')
                 continue
-            success, tx = buy_token(ca, ticker, invest, ep)
+            success, tx, meta = buy_token(ca, ticker, invest, ep)
             if success:
                 actual_ep = get_price_usd(ca)
                 if actual_ep <= 0:
                     actual_ep = ep
+                sl_pct = STOP_LOSS_PCT
+                tp_pct = TAKE_PROFIT_PCT
+                invest_used = invest
+                if isinstance(meta, dict):
+                    sl_pct = float(meta.get('sl_pct', sl_pct))
+                    tp_pct = float(meta.get('tp_pct', tp_pct))
+                    invest_used = float(meta.get('invest', invest))
                 state['positions'][ca] = {
                     'chain': 'Solana', 'chain_id': SOL_CHAIN,
                     'ticker': ticker, 'ca': ca,
                     'entry_price': actual_ep,
-                    'invest_amount': invest,
+                    'invest_amount': invest_used,
                     'amount': 0,
-                    'sl_price': round(actual_ep * (1 + STOP_LOSS_PCT), 12),
-                    'tp_price': round(actual_ep * (1 + TAKE_PROFIT_PCT), 12),
+                    'sl_price': round(actual_ep * (1 + sl_pct), 12),
+                    'tp_price': round(actual_ep * (1 + tp_pct), 12),
                     'pnl_pct': 0, 'pnl_usdt': 0,
                     'entry_time': now.isoformat(),
                     'sig_id': sig.get('sigId', ''),
@@ -723,7 +747,7 @@ def main():
                     'sold_ratio': float(sig.get('soldRatioPercent', 0)),
                     'sold_ratio_triggered': False,
                 }
-                usdt_bal -= invest
+                usdt_bal -= invest_used
                 sol_open += 1
                 save_state(state)
     print('')

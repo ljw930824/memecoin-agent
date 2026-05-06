@@ -11,6 +11,18 @@ from datetime import datetime, timezone, timedelta
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from qclaw_trading_common import (  # noqa: E402
+    locked_read_json,
+    locked_write_json,
+    okx_env_for_subprocess,
+    signal_chain_is_solana,
+    telegram_env,
+)
+
 DATA_DIR   = os.path.expanduser('~/.qclaw/workspace/data')
 STATE_FILE = os.path.join(DATA_DIR, 'smart-money-state.json')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
@@ -19,20 +31,14 @@ TRADE_LOG  = os.path.join(DATA_DIR, 'trade-log.json')
 ONCHAINOS  = r'C:\Users\dell\.local\bin\onchainos.exe'
 WALLET_ADDR = '77BP1JzBARGaQ8eJWj6B1RYvaB4zRxU7Nx7BDYdgLCAa'
 SOL_USDT    = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
-TG_TOKEN    = os.environ.get('TG_BOT_TOKEN', '8781701155:AAGdKt0oZm5bfaEY39ItcGkiW4phMfYkfbI')
-TG_CHAT_ID  = os.environ.get('TG_CHAT_ID', '821225400')
-
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {'positions': {}, 'cooldowns': {}}
+    return locked_read_json(STATE_FILE, {'positions': {}, 'cooldowns': {}})
 
 def save_state(s):
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(s, f, indent=2, ensure_ascii=False)
+    locked_write_json(STATE_FILE, s)
 
 def notify(msg):
+    TG_TOKEN, TG_CHAT_ID = telegram_env()
     if not TG_TOKEN:
         return
     try:
@@ -59,13 +65,7 @@ def log_trade(entry):
     with open(TRADE_LOG, 'w', encoding='utf-8') as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
 
-OKX_ENV = os.environ.copy()
-OKX_ENV['OKX_PROD_API_KEY'] = OKX_ENV.get('OKX_PROD_API_KEY') or OKX_ENV.get('OKX_API_KEY', '***REMOVED***')
-OKX_ENV['OKX_PROD_SECRET_KEY'] = OKX_ENV.get('OKX_PROD_SECRET_KEY') or OKX_ENV.get('OKX_SECRET_KEY', '***REMOVED***')
-OKX_ENV['OKX_PROD_PASSPHRASE'] = OKX_ENV.get('OKX_PROD_PASSPHRASE') or OKX_ENV.get('OKX_PASSPHRASE', '***REMOVED***')
-OKX_ENV['OKX_API_KEY'] = OKX_ENV['OKX_PROD_API_KEY']
-OKX_ENV['OKX_SECRET_KEY'] = OKX_ENV['OKX_PROD_SECRET_KEY']
-OKX_ENV['OKX_PASSPHRASE'] = OKX_ENV['OKX_PROD_PASSPHRASE']
+OKX_ENV = okx_env_for_subprocess() or os.environ.copy()
 
 def ocoin_run(args, timeout=30, retries=1):
     cmd = [ONCHAINOS] + args
@@ -266,7 +266,7 @@ def main():
 
         sig = next((s for s in queue
                     if s.get('ca', '').lower() == ca.lower()
-                    and s.get('chain') == 'CT_501'), None)
+                    and signal_chain_is_solana(s)), None)
         current_price = sig['currentPrice'] if sig else 0
         if not current_price or current_price <= 0:
             current_price = get_price_usd(ca)
@@ -292,12 +292,14 @@ def main():
             if sell_token(ca, ticker, 0.5, 'PARTIAL_TP10')[0]:
                 pos['partial_tp_10'] = True
                 pos['sl_price'] = max(float(pos['sl_price']), ep)
+                pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
 
         if pnl_pct >= 0.15 and not pos.get('partial_tp_15'):
             print('  [*] ' + ticker + ' +15% -> partial TP 25%')
             if sell_token(ca, ticker, 0.5, 'PARTIAL_TP15')[0]:
                 pos['partial_tp_15'] = True
                 pos['sl_price'] = max(float(pos['sl_price']), ep * 1.03)
+                pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
 
         if pnl_pct >= 0.08 and not pos.get('breakeven_done'):
             pos['sl_price'] = max(float(pos['sl_price']), ep)
