@@ -2175,6 +2175,7 @@ def process_new_trades(trades, state, wallets):
 
 
 
+    now = time.time()
     for ca, act in activity.items():
 
 
@@ -2220,6 +2221,13 @@ def process_new_trades(trades, state, wallets):
 
 
         # ?token ?
+        # Dedup: skip if recently bought (crash-recovery protection)
+        recent_trades = [t for t in state.get('trade_history', [])
+            if t.get('contract_address') == ca and t.get('reason') in ('buy','sm_buy')
+            and now - t.get('ts', 0) < 3600]
+        if recent_trades:
+            log(f'SKIP {sym}: recently traded (cooldown)')
+            continue
 
         if act['buys'] > 0:
 
@@ -2397,6 +2405,14 @@ def process_new_trades(trades, state, wallets):
 
 
                 positions[ca] = pos_data
+                # Record in trade_history for dedup (cross-cycle protection)
+                state.setdefault('trade_history', []).append({
+                    'contract_address': ca, 'symbol': sym, 'reason': 'sm_buy',
+                    'ts': int(time.time()), 'amount_usd': dynamic_buy, 'chain': chain
+                })
+                if len(state.get('trade_history', [])) > 500:
+                    state['trade_history'] = state['trade_history'][-500:]
+                save_state(state)  # immediate persist after buy (dedup + crash protection)
 
 
     return positions
