@@ -385,7 +385,7 @@ def get_effective_risk(state):
     realized_daily = 0.0
     for t in state.get('trade_history', []):
         if t.get('exit_ts', 0) >= today_start:
-            realized_daily += t.get('exit_usd', 0) - t.get('entry_usd_amount', BUY_SIZE_USDT)
+            realized_daily += t.get('exit_usd', t.get('exit_usd_amount', 0)) - t.get('entry_usd_amount', BUY_SIZE_USDT)
     unrealized_daily = 0.0
     for ca, p in state.get('positions', {}).items():
         if int(p.get('entry_ts', 0)) >= today_start:
@@ -454,7 +454,7 @@ def check_risk_limits(state):
     realized_monthly = 0.0
     for t in state.get('trade_history', []):
         exit_ts = t.get('exit_ts', 0)
-        exit_usd = t.get('exit_usd', 0)
+        exit_usd = t.get('exit_usd', t.get('exit_usd_amount', 0))
         entry_usd = t.get('entry_usd_amount', BUY_SIZE_USDT)
         pnl_usd = exit_usd - entry_usd
         if exit_ts >= month_start:

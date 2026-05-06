@@ -40,8 +40,13 @@ from collections import defaultdict
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-
-
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+try:
+    from qclaw_trading_common import okx_env_for_subprocess  # noqa: E402
+except ImportError:
+    okx_env_for_subprocess = None  # type: ignore
 
 
 # ===  ===
@@ -385,7 +390,7 @@ def get_effective_risk(state):
     realized_daily = 0.0
     for t in state.get('trade_history', []):
         if t.get('exit_ts', 0) >= today_start:
-            realized_daily += t.get('exit_usd', 0) - t.get('entry_usd_amount', BUY_SIZE_USDT)
+            realized_daily += t.get('exit_usd', t.get('exit_usd_amount', 0)) - t.get('entry_usd_amount', BUY_SIZE_USDT)
     unrealized_daily = 0.0
     for ca, p in state.get('positions', {}).items():
         if int(p.get('entry_ts', 0)) >= today_start:
@@ -463,7 +468,7 @@ def check_risk_limits(state):
     realized_monthly = 0.0
     for t in state.get('trade_history', []):
         exit_ts = t.get('exit_ts', 0)
-        exit_usd = t.get('exit_usd', 0)
+        exit_usd = t.get('exit_usd', t.get('exit_usd_amount', 0))
         entry_usd = t.get('entry_usd_amount', BUY_SIZE_USDT)
         pnl_usd = exit_usd - entry_usd
         if exit_ts >= month_start:
@@ -1079,25 +1084,9 @@ def oc_run(cmd, timeout=20):
     try:
 
 
-        env = os.environ.copy()
-
-
-        env['OKX_PROD_API_KEY'] = env.get('OKX_PROD_API_KEY') or env.get('OKX_API_KEY', '***REMOVED***')
-
-
-        env['OKX_PROD_SECRET_KEY'] = env.get('OKX_PROD_SECRET_KEY') or env.get('OKX_SECRET_KEY', '***REMOVED***')
-
-
-        env['OKX_PROD_PASSPHRASE'] = env.get('OKX_PROD_PASSPHRASE') or env.get('OKX_PASSPHRASE', '***REMOVED***')
-
-
-        env['OKX_API_KEY'] = env['OKX_PROD_API_KEY']
-
-
-        env['OKX_SECRET_KEY'] = env['OKX_PROD_SECRET_KEY']
-
-
-        env['OKX_PASSPHRASE'] = env['OKX_PROD_PASSPHRASE']
+        env = okx_env_for_subprocess() if okx_env_for_subprocess else None
+        if not env:
+            env = dict(os.environ)
 
 
         env['PYTHONIOENCODING'] = 'utf-8'
@@ -2370,9 +2359,10 @@ def process_new_trades(trades, state, wallets):
                             pos_data['limit_order_ts'] = int(time.time())
 
 
-                        # else:
+                        else:
 
-                log(f'WARN: {sym} TP limit order failed, position unprotected')
+
+                            log(f'WARN: {sym} TP limit order failed, position unprotected')
 
 
                 positions[ca] = pos_data
