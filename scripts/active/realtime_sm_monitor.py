@@ -749,6 +749,7 @@ def save_state(state):
     state.setdefault('trade_history', [])
 
 
+    state.setdefault('seen_txs', [])
     state['seen_txs'] = state['seen_txs'][-1000:]
 
 

@@ -725,6 +725,7 @@ def save_state(state):
     state.setdefault('trade_history', [])
 
 
+    state.setdefault('seen_txs', [])
     state['seen_txs'] = state['seen_txs'][-1000:]
 
 
@@ -3020,10 +3021,7 @@ def run_once(state, wallets):
 
 
 
-    if positions:
-
-
-        can_trade, reason = check_risk_limits(state)
+    can_trade, reason = check_risk_limits(state)
     risk_status = 'OK' if can_trade else f'BLOCKED({reason})'
     log(f'Risk status: {risk_status}')
 
