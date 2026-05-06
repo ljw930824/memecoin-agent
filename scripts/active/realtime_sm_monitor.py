@@ -2408,7 +2408,7 @@ def process_new_trades(trades, state, wallets):
 
 
 
-def check_positions(positions):
+def check_positions(positions, state=None):
 
 
     """docstring"""
@@ -3051,7 +3051,7 @@ def run_once(state, wallets):
 
 
 
-    positions = check_positions(positions)
+    positions = check_positions(positions, state)
 
 
     state['positions'] = positions
