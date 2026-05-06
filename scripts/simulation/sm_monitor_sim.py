@@ -1,4 +1,4 @@
-"""
+﻿"""
 
 
 realtime_sm_monitor.py v3.3 ??(Bug ?
@@ -73,6 +73,9 @@ BNB_BSC = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
 TP_PCT = 0.12           # BSC  +12% ?
 
 LIMIT_ORDER_TIMEOUT = 1800  # = 30+?
+# --- Hot-reload tracking ---
+_STATE_FILE_MTIME = 0
+
 
 
 
@@ -87,6 +90,8 @@ def usdt_addr(chain):
 
 
 STATE_FILE = os.path.join(DATA, 'sm_monitor_state_dryrun.json')
+CMD_FILE = os.path.join(DATA, 'sm_commands.json')
+
 
 
 LOG_FILE = os.path.join(DATA, 'sm_trade-log_dryrun.txt')
@@ -575,6 +580,112 @@ def load_state():
 
 
 
+
+def reload_positions_if_external_change(state):
+    """If state file was modified externally (mtime changed), reload positions."""
+    global _STATE_FILE_MTIME
+    try:
+        current_mtime = os.path.getmtime(STATE_FILE)
+    except OSError:
+        return  # file doesn't exist yet
+    if _STATE_FILE_MTIME == 0:
+        _STATE_FILE_MTIME = current_mtime
+        return
+    if current_mtime != _STATE_FILE_MTIME:
+        try:
+            with open(STATE_FILE, encoding='utf-8') as f:
+                file_state = json.load(f)
+            file_positions = file_state.get('positions', {})
+            # Compare to detect actual external changes
+            current_positions = state.get('positions', {})
+            removed = set(current_positions.keys()) - set(file_positions.keys())
+            added = set(file_positions.keys()) - set(current_positions.keys())
+            if removed or added:
+                log(f'[HOT-RELOAD] State file externally modified. '
+                    f'Removed: {len(removed)}, Added: {len(added)}')
+                state['positions'] = file_positions
+                # Also sync trade_history if it changed
+                if len(file_state.get('trade_history', [])) > len(state.get('trade_history', [])):
+                    state['trade_history'] = file_state.get('trade_history', [])
+            _STATE_FILE_MTIME = current_mtime
+        except Exception as e:
+            log(f'[HOT-RELOAD] Error reloading state: {e}')
+        _STATE_FILE_MTIME = current_mtime
+
+def process_commands(state):
+    """Read and execute commands from external command file."""
+    if not os.path.exists(CMD_FILE):
+        return
+    try:
+        with open(CMD_FILE, 'r', encoding='utf-8') as f:
+            commands = json.load(f)
+        if not commands:
+            return
+    except Exception:
+        return
+
+    # Clear file immediately to prevent re-execution
+    try:
+        with open(CMD_FILE, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+    except Exception:
+        pass
+
+    positions = state.get('positions', {})
+
+    for cmd in commands:
+        action = cmd.get('action', '')
+        log(f'[CMD] Processing: {action} {cmd.get("symbol", cmd.get("contract_address", "")[:16])}')
+
+        if action == 'remove_position':
+            ca = cmd.get('contract_address', '')
+            reason = cmd.get('reason', 'external_command')
+            if ca in positions:
+                pos = positions[ca]
+                exit_price = float(cmd.get('exit_price', pos.get('entry_price', 0)))
+                entry_price = float(pos.get('entry_price', 0))
+                pnl_pct = ((exit_price / entry_price) - 1) * 100 if entry_price > 0 else 0
+                exit_usd = float(cmd.get('exit_usd', 0))
+                _save_trade_history(state, pos, exit_price, pnl_pct, reason, exit_usd)
+                del positions[ca]
+                log(f'[CMD] Removed {pos.get("symbol", "?")} (PnL={pnl_pct:.1f}%)')
+            else:
+                log(f'[CMD] Position not found: {ca[:16]}...')
+
+        elif action == 'update_position':
+            ca = cmd.get('contract_address', '')
+            updates = cmd.get('updates', {})
+            if ca in positions:
+                positions[ca].update(updates)
+                log(f'[CMD] Updated {positions[ca].get("symbol", "?")}: {list(updates.keys())}')
+            else:
+                log(f'[CMD] Position not found: {ca[:16]}...')
+
+        elif action == 'reload_state':
+            try:
+                with open(STATE_FILE, encoding='utf-8') as f:
+                    file_state = json.load(f)
+                state['positions'] = file_state.get('positions', {})
+                state['trade_history'] = file_state.get('trade_history', state.get('trade_history', []))
+                positions = state['positions']
+                log(f'[CMD] State reloaded from file. Positions: {list(positions.keys())}')
+            except Exception as e:
+                log(f'[CMD] Reload failed: {e}')
+
+        elif action == 'set_risk':
+            # Override risk params at runtime
+            global RISK_PCT, MAX_DAILY_LOSS_PCT
+            if 'risk_pct' in cmd:
+                RISK_PCT = float(cmd['risk_pct'])
+                log(f'[CMD] RISK_PCT set to {RISK_PCT:.1%}')
+            if 'daily_limit' in cmd:
+                MAX_DAILY_LOSS_PCT = float(cmd['daily_limit'])
+                log(f'[CMD] MAX_DAILY_LOSS_PCT set to {MAX_DAILY_LOSS_PCT:.1%}')
+
+        else:
+            log(f'[CMD] Unknown action: {action}')
+
+    state['positions'] = positions
 
 def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0.0):
     """Append closed position to trade_history."""
@@ -2865,6 +2976,11 @@ def check_positions(positions):
 def run_once(state, wallets):
 
 
+    reload_positions_if_external_change(state)
+    positions = state.get("positions", {})  # refresh after hot-reload
+    process_commands(state)
+    positions = state.get("positions", {})  # refresh after commands
+
     trades = fetch_tracker()
 
 
@@ -2996,6 +3112,13 @@ def main():
 
     try:
 
+
+        # Initialize mtime tracking
+        global _STATE_FILE_MTIME
+        try:
+            _STATE_FILE_MTIME = os.path.getmtime(STATE_FILE)
+        except:
+            _STATE_FILE_MTIME = 0
 
         while True:
 
