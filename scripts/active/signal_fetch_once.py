@@ -172,7 +172,9 @@ def score_binance(sig):
     ap = float(sig.get('alertPrice', 0) or 0)
     if ap > 0 and cp > 0:
         spread = (cp - ap) / ap
-        if abs(spread) > 0.05: return 0, f"SPREAD={spread:.1%}"
+        if abs(spread) > 0.25: return 0, f"SPREAD={spread:.1%}"
+        elif abs(spread) > 0.15: score -= 30
+        elif abs(spread) > 0.05: score -= 15
         if spread < -0.10:     score -= 15
         elif spread < -0.05:   score += 5
         elif spread <= 0.03:   score += 8

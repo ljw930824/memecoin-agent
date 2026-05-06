@@ -880,7 +880,7 @@ def reconcile_wallet(state):
     try:
 
 
-        r = subprocess.run(['baw.cmd' if sys.platform == 'win32' else 'baw', 'wallet', 'balance', '--json'], capture_output=True, timeout=10, encoding='utf-8', errors='replace')
+        r = subprocess.run([os.path.expanduser('~\\AppData\\Roaming\\QClaw\\npm-global\\baw.cmd') if sys.platform == 'win32' else 'baw', 'wallet', 'balance', '--json'], capture_output=True, timeout=10, encoding='utf-8', errors='replace')
 
 
         if r.returncode == 0:
@@ -1122,7 +1122,7 @@ def baw_run(args, timeout=30):
     try:
 
 
-        r = subprocess.run(['baw.cmd' if sys.platform == 'win32' else 'baw'] + args, capture_output=True, timeout=timeout,
+        r = subprocess.run([os.path.expanduser('~\\AppData\\Roaming\\QClaw\\npm-global\\baw.cmd') if sys.platform == 'win32' else 'baw'] + args, capture_output=True, timeout=timeout,
 
 
                            encoding='utf-8', errors='replace')
@@ -1571,6 +1571,29 @@ def place_tp_limit_order(token_ca, token_balance, entry_price, sym):
 
 
 
+
+
+def place_sl_limit_order(token_ca, token_balance, entry_price, sym):
+    """BSC SL"""
+    sl_price = entry_price * (1 + SL_PCT)
+    out, _ = baw_run([
+        'limit-order', 'sell',
+        '--binanceChainId', '56',
+        '--triggerPrice', f'${sl_price:.10f}',
+        '--fromTokenQty', str(token_balance),
+        '--fromToken', token_ca,
+        '--toToken', USDT_BSC,
+        '--slippage', '15',
+        '--json'
+    ], timeout=20)
+    d = parse_baw_json(out)
+    if d and d.get('success'):
+        oid = d.get('data', {}).get('strategyId', '')
+        log(f'SL LIMIT OK: {sym} ${sl_price:.8f} ({SL_PCT:+.0%}) id={oid}')
+        return True, str(oid)
+    else:
+        log(f'SL LIMIT FAIL: {sym} {(out or "?")[:80]}')
+        return False, ''
 
 def cancel_limit_order(order_id, sym):
 
@@ -2348,6 +2371,7 @@ def process_new_trades(trades, state, wallets):
 
 
                         oid = place_tp_limit_order(ca, token_bal, entry_price, sym)
+                        sl_oid = place_sl_limit_order(ca, token_bal, entry_price, sym)
 
 
                         if oid:

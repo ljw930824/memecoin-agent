@@ -317,6 +317,46 @@ def place_tp_limit_order(ca, ticker, amount_tokens, tp_price):
     return False, last_err
 
 
+
+def place_sl_limit_order(ca, ticker, amount_tokens, sl_price):
+    """Place SL limit sell order immediately after buy.
+    Returns (success, strategy_id_or_error_msg)
+    """
+    print(f"     [SL LIMIT] Placing limit sell {ticker} @ {sl_price:.10f}")
+    last_err = ""
+    for attempt in range(1, 4):
+        out, err, code = baw_run([
+            "limit-order", "sell",
+            "--binanceChainId", CHAIN_ID,
+            "--triggerPrice", str(sl_price),
+            "--fromTokenQty", str(amount_tokens),
+            "--fromToken", ca,
+            "--toToken", BSC_USDT,
+            "--slippage", "5",
+            "--gasLevel", "HIGH",
+            "--json"
+        ], timeout=60)
+        if code == 0 and out:
+            try:
+                data = json.loads(out)
+                if data.get("success"):
+                    strategy_id = ""
+                    if "data" in data and isinstance(data["data"], dict):
+                        strategy_id = str(data["data"].get("strategyId", ""))
+                    print(f"     [SL LIMIT] OK (strategyId={strategy_id})")
+                    return True, strategy_id
+            except Exception:
+                pass
+        err_msg = err or out
+        last_err = err_msg
+        print(f"     [SL LIMIT] Attempt {attempt} failed: {err_msg[:200]}")
+        if attempt < 3:
+            wait_time = 2 * attempt
+            print(f"     [SL LIMIT] Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+    print(f"     [SL LIMIT] All attempts failed")
+    return False, last_err
+
 def rollback_position(ca, ticker, amount_tokens):
     """Immediately market-sell after failed TP limit order.
     Returns True if tokens are confirmed sold, False otherwise.
@@ -493,6 +533,8 @@ def sync_positions_with_chain(state):
             print(f"  [SYNC] GHOST: {ticker} — in state but NOT on-chain. Removing.")
             invest = float(pos.get("invest_amount", 0))
             pnl_pct = float(pos.get("pnl_pct", 0))
+            cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
+            cancel_limit_order(ca, ticker, pos.get("sl_strategy_id", ""), "SL")
             record_trade_close(ca, "GHOST_CLEANUP", pnl_pct)
             del state["positions"][ca]
             cleaned.append(ticker)
@@ -526,6 +568,32 @@ def update_position_pnl(ca, current_price):
         pos["current_price"] = current_price
 
 
+
+def cancel_limit_order(ca, ticker, strategy_id, label="LIMIT"):
+    """Cancel a pending limit order by strategy ID."""
+    if not strategy_id:
+        return True  # Nothing to cancel
+    print(f"     [{label} CANCEL] Cancelling order {strategy_id} for {ticker}")
+    for attempt in range(1, 3):
+        out, err, code = baw_run([
+            "limit-order", "cancel",
+            "--strategyId", strategy_id,
+            "--binanceChainId", CHAIN_ID,
+            "--json"
+        ], timeout=30)
+        if code == 0 and out:
+            try:
+                data = json.loads(out)
+                if data.get("success"):
+                    print(f"     [{label} CANCEL] OK")
+                    return True
+            except Exception:
+                pass
+        print(f"     [{label} CANCEL] Attempt {attempt} failed: {(err or out)[:100]}")
+        time.sleep(2)
+    print(f"     [{label} CANCEL] Failed - order may still be active")
+    return False
+
 def check_and_close_position(ca):
     """Check SL/TP and manage position. Returns True if closed."""
     pos = state["positions"].get(ca)
@@ -555,6 +623,8 @@ def check_and_close_position(ca):
             baw_run(["limit-order", "cancel", "--strategyId", str(tp_strategy_id)], timeout=15)
         success, tx = sell_token(ca, ticker, 1.0, "SL_HIT")
         if success:
+            cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
+            cancel_limit_order(ca, ticker, pos.get("sl_strategy_id", ""), "SL")
             record_trade_close(ca, "SL_HIT", pnl_pct)
             del state["positions"][ca]
             state["cooldowns"][ca] = (
@@ -575,6 +645,8 @@ def check_and_close_position(ca):
             baw_run(["limit-order", "cancel", "--strategyId", str(tp_strategy_id)], timeout=15)
         success, tx = sell_token(ca, ticker, 1.0, "TP_HIT")
         if success:
+            cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
+            cancel_limit_order(ca, ticker, pos.get("sl_strategy_id", ""), "SL")
             record_trade_close(ca, "TP_HIT", pnl_pct)
             del state["positions"][ca]
             state["cooldowns"][ca] = (
@@ -648,6 +720,8 @@ def check_and_close_position(ca):
             print(f"  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE")
             success, tx = sell_token(ca, ticker, 1.0, "SOLD_RATIO_EXIT")
             if success:
+                cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
+                cancel_limit_order(ca, ticker, pos.get("sl_strategy_id", ""), "SL")
                 record_trade_close(ca, "SOLD_RATIO_EXIT", pnl_pct)
                 del state["positions"][ca]
                 _now = datetime.now(timezone(timedelta(hours=8)))
@@ -925,6 +999,17 @@ def main():
                         notify_telegram(f"🚨 <b>BSC Rollback Failed</b>\n{ticker} bought but TP limit + rollback both failed. Position force-kept with SL protection.")
                         tp_limit_placed = False
 
+                # Place SL limit order (critical for downside protection)
+                sl_ok, sl_result = place_sl_limit_order(ca, ticker, amount_tokens, sl_price)
+                sl_strategy_id = ""
+                sl_limit_error = ""
+                if sl_ok:
+                    sl_strategy_id = str(sl_result) if sl_result else ""
+                    print(f"     [SL LIMIT] Recorded strategyId={sl_strategy_id}")
+                else:
+                    sl_limit_error = str(sl_result)[:200] if sl_result else "unknown_error"
+                    log_retry(ticker, "SL_LIMIT_FAILED", sl_limit_error, 1)
+
                 # Record position (even if TP limit failed — SL via market-order will protect)
                 state["positions"][ca] = {
                     "chain": "BSC",
@@ -951,7 +1036,9 @@ def main():
                     "tp_limit_placed": tp_limit_placed,
                     "tp_strategy_id": tp_strategy_id,
                     "tp_limit_error": tp_limit_error,
-                    "sl_strategy_id": "",  # Reserved for future SL limit order support
+                    "sl_limit_placed": sl_ok,
+                    "sl_strategy_id": sl_strategy_id,
+                    "sl_limit_error": sl_limit_error,
                 }
                 state.setdefault("last_signal_ids", [])
                 state["last_signal_ids"].append(_sig_id)
