@@ -2979,6 +2979,7 @@ def run_once(state, wallets):
     reload_positions_if_external_change(state)
     positions = state.get("positions", {})  # refresh after hot-reload
     process_commands(state)
+    save_state(state)  # persist command results immediately (cmd file already cleared)
     positions = state.get("positions", {})  # refresh after commands
 
     trades = fetch_tracker()
