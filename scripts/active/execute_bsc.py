@@ -580,8 +580,9 @@ def sync_positions_with_chain(state):
             # Significant balance discrepancy — update amount
             print(f"  [SYNC] MISMATCH: {ticker} — state={pos.get('amount',0):.2f} vs chain={actual_bal:.2f}. Updating.")
             pos["amount"] = actual_bal
+            save_state(state)
 
-    if cleaned:
+    if cleaned or True:  # always save after sync
         save_state(state)
         notify_telegram(f"🧹 <b>Position Sync</b>\nCleaned ghost positions: {', '.join(cleaned)}")
 
@@ -671,6 +672,8 @@ def check_and_close_position(ca):
             ).isoformat()
             closed = True
             close_reason = "SL"
+        save_state(state)
+
         return closed
 
     # ─── Take Profit ───
@@ -693,7 +696,8 @@ def check_and_close_position(ca):
             ).isoformat()
             closed = True
             close_reason = "TP"
-        return closed
+            save_state(state)
+            return closed
 
     # ─── Ladder TP (onchainos v3.2) ───
     ladder_step = pos.get('ladder_step', 0)
@@ -823,17 +827,20 @@ def check_and_close_position(ca):
             print(f"  [CANCEL] Cancelling old TP limit {tp_sid} before partial TP")
             baw_run(["limit-order", "cancel", "--strategyId", str(tp_sid)], timeout=15)
             pos["tp_strategy_id"] = ""
+            save_state(state)
         success, tx = sell_token(ca, ticker, 0.5, "PARTIAL_TP10")
         if success:
             pos["partial_tp_10_done"] = True
             pos["sl_price"] = max(float(pos.get("sl_price", 0)), ep * 1.0)
             pos["amount"] = float(pos.get("amount", 0)) * 0.5
+            save_state(state)
             # Place new TP limit order for remaining 50% at +12%
             remaining = pos.get("amount", 0)
             if remaining > 0:
                 tp_ok, tp_res = place_tp_limit_order(ca, ticker, remaining, pos.get("tp_price", ep * 1.12))
                 if tp_ok:
                     pos["tp_strategy_id"] = str(tp_res)
+                    save_state(state)
                     print(f"  [NEW TP LIMIT] strategyId={tp_res}")
 
     if pnl_pct >= 0.15 and not pos.get("partial_tp_15_done"):
@@ -843,21 +850,25 @@ def check_and_close_position(ca):
             print(f"  [CANCEL] Cancelling old TP limit {tp_sid} before partial TP")
             baw_run(["limit-order", "cancel", "--strategyId", str(tp_sid)], timeout=15)
             pos["tp_strategy_id"] = ""
+            save_state(state)
         success, tx = sell_token(ca, ticker, 0.5, "PARTIAL_TP15")
         if success:
             pos["partial_tp_15_done"] = True
             pos["sl_price"] = max(float(pos.get("sl_price", 0)), ep * 1.03)
             pos["amount"] = float(pos.get("amount", 0)) * 0.5
+            save_state(state)
             remaining = pos.get("amount", 0)
             if remaining > 0:
                 tp_ok, tp_res = place_tp_limit_order(ca, ticker, remaining, pos.get("tp_price", ep * 1.12))
                 if tp_ok:
                     pos["tp_strategy_id"] = str(tp_res)
+                    save_state(state)
                     print(f"  [NEW TP LIMIT] strategyId={tp_res}")
 
     if pnl_pct >= 0.08 and not pos.get("breakeven_done"):
         pos["sl_price"] = max(float(pos.get("sl_price", 0)), ep)
         pos["breakeven_done"] = True
+        save_state(state)
 
     # v3.2: Trailing stop — after breakeven, track SL 2% below peak
     if pos.get("breakeven_done"):
@@ -868,6 +879,7 @@ def check_and_close_position(ca):
         trailing_sl = peak * (1 - TRAILING_DISTANCE)
         if trailing_sl > float(pos.get("sl_price", 0)):
             pos["sl_price"] = trailing_sl
+            save_state(state)
             print(f"  [TRAILING] {ticker} SL -> ${trailing_sl:.10f} (peak ${peak:.10f})")
 
 
