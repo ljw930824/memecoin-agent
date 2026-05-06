@@ -899,7 +899,7 @@ def reconcile_wallet(state):
                 for item in items:
 
 
-                    addr = item.get('contractAddress', '') or item.get('address', '')
+                    addr = item.get('address') or item.get('contractAddress', '') or item.get('address', '')
 
 
                     sym = item.get('symbol', '?')
@@ -1366,13 +1366,13 @@ def get_balance_bsc():
     result = {}
 
 
-    for item in d.get('data', {}).get('balances', []):
+    for item in d.get('data', []) if isinstance(d.get('data'), list) else d.get('data', {}).get('balances', []):
 
 
         bal = float(item.get('balance', 0) or 0)
 
 
-        ca = item.get('contractAddress', '')
+        ca = item.get('address') or item.get('contractAddress', '')
 
 
         if bal > 0 and ca:
