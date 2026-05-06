@@ -45,6 +45,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 try:
     from qclaw_trading_common import okx_env_for_subprocess  # noqa: E402
+from shared_dedup import is_bought as shared_is_bought, mark_bought as shared_mark_bought, mark_sold as shared_mark_sold
 except ImportError:
     okx_env_for_subprocess = None  # type: ignore
 
@@ -2313,6 +2314,12 @@ def process_new_trades(trades, state, wallets):
                 continue
 
             dynamic_buy = calc_buy_size(state)
+
+            # Shared dedup: check if BAW already bought this token
+            if chain == 'bsc' and 'shared_is_bought' in dir():
+                if shared_is_bought(ca):
+                    log(f'SKIP {sym}: already bought by BAW (shared dedup)')
+                    continue
 
             ok, tx = execute_buy(chain, ca, dynamic_buy)
 

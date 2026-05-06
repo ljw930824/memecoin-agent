@@ -27,6 +27,7 @@ from qclaw_trading_common import (
 DATA_DIR    = os.path.expanduser("~/.qclaw/workspace/data")
 STATE_FILE  = os.path.join(DATA_DIR, "smart-money-state.json")
 QUEUE_FILE  = os.path.join(DATA_DIR, "signal-queue.json")
+SHARED_DEDUP = os.path.join(DATA_DIR, "shared_bought.json")
 RETRY_LOG   = os.path.join(DATA_DIR, "retry-log.txt")
 TRADE_LOG   = os.path.join(DATA_DIR, "trade-log.json")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -49,6 +50,13 @@ SCALP_THRESHOLD     = 28
 STRONG_THRESHOLD    = 50
 COOLDOWN_AFTER_SL   = 12  # hours
 COOLDOWN_AFTER_TP   = 6   # hours
+
+# Ladder TP (matching onchainos v3.2)
+LADDER_TP     = [0.30, 1.00, 3.00]   # +30%, +100%, +300%
+LADDER_RATIOS = [0.77, 0.50, 0.50]   # sell ratios at each level
+SM_SELL_FOLLOW = 3                    # sell if 3+ SM wallets sell
+SOLD_RATIO_EXIT_THRESH = 50           # full close if soldRatio >= 50%
+SOLD_RATIO_REDUCE_THRESH = 30         # reduce 50% if soldRatio >= 30%
 
 # v3.2 Risk Management
 MAX_DAILY_LOSS_PCT      = 0.15   # Max daily drawdown -15%
@@ -82,6 +90,36 @@ def save_state(state):
 
 
 # ─── Telegram Alert (credentials from environment only) ───
+# ═══ Shared Dedup (prevent BAW+onchainos buying same token) ═══
+def _shared_dedup_load():
+    if os.path.exists(SHARED_DEDUP):
+        try:
+            with open(SHARED_DEDUP, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _shared_dedup_save(data):
+    tmp = SHARED_DEDUP + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, SHARED_DEDUP)
+
+def shared_is_bought(ca):
+    return ca.lower() in _shared_dedup_load()
+
+def shared_mark_bought(ca, ticker, chain="56"):
+    d = _shared_dedup_load()
+    d[ca.lower()] = {"ticker": ticker, "chain": chain, "ts": int(time.time())}
+    _shared_dedup_save(d)
+
+def shared_mark_sold(ca):
+    d = _shared_dedup_load()
+    d.pop(ca.lower(), None)
+    _shared_dedup_save(d)
+
+
 def notify_telegram(msg):
     TG_BOT_TOKEN, TG_CHAT_ID = telegram_env()
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -657,6 +695,125 @@ def check_and_close_position(ca):
             close_reason = "TP"
         return closed
 
+    # ─── Ladder TP (onchainos v3.2) ───
+    ladder_step = pos.get('ladder_step', 0)
+    if ladder_step < len(LADDER_TP) and pnl_pct >= LADDER_TP[ladder_step]:
+        ratio = LADDER_RATIOS[ladder_step] if ladder_step < len(LADDER_RATIOS) else 0.5
+        print(f'  [LADDER] {ticker} +{pnl_pct*100:.1f}% -> sell {ratio*100:.0f}% (step {ladder_step+1})')
+        for sk in ['tp_strategy_id', 'sl_strategy_id']:
+            sid = pos.get(sk, '')
+            if sid:
+                cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+                pos[sk] = ''
+        success, tx = sell_token(ca, ticker, ratio, f'LADDER_TP{ladder_step}')
+        if success:
+            pos['ladder_step'] = ladder_step + 1
+            pos['sold_pct'] = float(pos.get('sold_pct', 0)) + ratio
+            pos['amount'] = float(pos.get('amount', 0)) * (1.0 - ratio)
+            if float(pos.get('sold_pct', 0)) >= 0.99:
+                record_trade_close(ca, f'LADDER_TP{ladder_step}', pnl_pct)
+                shared_mark_sold(ca)
+                del state['positions'][ca]
+                save_state(state)
+                return True
+            if ladder_step == 0:
+                pos['sl_price'] = max(float(pos.get('sl_price', 0)), ep)
+            save_state(state)
+        return False
+
+    # ─── SM sell follow ───
+    sm_sells = pos.get('sm_sells', 0)
+    if sm_sells >= SM_SELL_FOLLOW and not pos.get('sm_sell_done'):
+        print(f'  [SM SELL] {ticker} sm_sells={sm_sells} -> FULL CLOSE')
+        for sk in ['tp_strategy_id', 'sl_strategy_id']:
+            sid = pos.get(sk, '')
+            if sid:
+                cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+        success, tx = sell_token(ca, ticker, 1.0, 'SM_SELL_FOLLOW')
+        if success:
+            pos['sm_sell_done'] = True
+            record_trade_close(ca, 'SM_SELL_FOLLOW', pnl_pct)
+            shared_mark_sold(ca)
+            del state['positions'][ca]
+            save_state(state)
+            return True
+
+    # ─── soldRatio-based exit ───
+    sold_ratio = float(pos.get('sold_ratio', 0))
+    if sold_ratio >= SOLD_RATIO_EXIT_THRESH and not pos.get('sold_ratio_triggered'):
+        print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE')
+        for sk in ['tp_strategy_id', 'sl_strategy_id']:
+            sid = pos.get(sk, '')
+            if sid:
+                cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+        success, tx = sell_token(ca, ticker, 1.0, 'SOLD_RATIO_EXIT')
+        if success:
+            pos['sold_ratio_triggered'] = True
+            record_trade_close(ca, 'SOLD_RATIO_EXIT', pnl_pct)
+            shared_mark_sold(ca)
+            del state['positions'][ca]
+            save_state(state)
+            return True
+    elif sold_ratio >= SOLD_RATIO_REDUCE_THRESH and not pos.get('sold_ratio_triggered'):
+        print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> reduce 50%')
+        for sk in ['tp_strategy_id', 'sl_strategy_id']:
+            sid = pos.get(sk, '')
+            if sid:
+                cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+                pos[sk] = ''
+        success, tx = sell_token(ca, ticker, 0.5, 'SOLD_RATIO_REDUCE')
+        if success:
+            pos['sold_ratio_triggered'] = True
+            pos['sl_price'] = max(float(pos.get('sl_price', 0)), ep)
+            pos['amount'] = float(pos.get('amount', 0)) * 0.5
+            pos['sold_pct'] = float(pos.get('sold_pct', 0)) + 0.5
+            save_state(state)
+
+    # ─── Time-weighted stop loss (onchainos v3.2) ───
+    entry_ts = int(pos.get('entry_ts', 0) or 0)
+    if entry_ts:
+        hold_hours = (time.time() - entry_ts) / 3600
+        if hold_hours >= 48:
+            print(f'  [TIME] {ticker} held {hold_hours:.1f}h >= 48h -> FORCE SELL')
+            for sk in ['tp_strategy_id', 'sl_strategy_id']:
+                sid = pos.get(sk, '')
+                if sid:
+                    cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+            success, tx = sell_token(ca, ticker, 1.0, 'TIME_48H')
+            if success:
+                record_trade_close(ca, 'TIME_48H', pnl_pct)
+                shared_mark_sold(ca)
+                del state['positions'][ca]
+                save_state(state)
+                return True
+        elif hold_hours >= 24 and pnl_pct < 0.05:
+            print(f'  [TIME] {ticker} held {hold_hours:.1f}h < +5% -> FORCE SELL')
+            for sk in ['tp_strategy_id', 'sl_strategy_id']:
+                sid = pos.get(sk, '')
+                if sid:
+                    cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+            success, tx = sell_token(ca, ticker, 1.0, 'TIME_24H')
+            if success:
+                record_trade_close(ca, 'TIME_24H', pnl_pct)
+                shared_mark_sold(ca)
+                del state['positions'][ca]
+                save_state(state)
+                return True
+        elif hold_hours >= 12 and pnl_pct < 0.15:
+            print(f'  [TIME] {ticker} held {hold_hours:.1f}h < +15% -> reduce 50%')
+            success, tx = sell_token(ca, ticker, 0.5, 'TIME_12H')
+            if success:
+                pos['amount'] = float(pos.get('amount', 0)) * 0.5
+                pos['sold_pct'] = float(pos.get('sold_pct', 0)) + 0.5
+                save_state(state)
+        elif hold_hours >= 6 and pnl_pct < 0.30:
+            print(f'  [TIME] {ticker} held {hold_hours:.1f}h < +30% -> reduce 50%')
+            success, tx = sell_token(ca, ticker, 0.5, 'TIME_6H')
+            if success:
+                pos['amount'] = float(pos.get('amount', 0)) * 0.5
+                pos['sold_pct'] = float(pos.get('sold_pct', 0)) + 0.5
+                save_state(state)
+
     # ─── Dynamic Partial TP (v3 rule) ───
     if pnl_pct >= 0.10 and not pos.get("partial_tp_10_done"):
         print(f"  [*] {ticker} +{pnl_pct*100:.1f}% -> partial TP 50%")
@@ -713,30 +870,6 @@ def check_and_close_position(ca):
             pos["sl_price"] = trailing_sl
             print(f"  [TRAILING] {ticker} SL -> ${trailing_sl:.10f} (peak ${peak:.10f})")
 
-    # soldRatio-based exit: smart money reducing
-    sold_ratio = pos.get("sold_ratio", 0)
-    if sold_ratio > 0 and not pos.get("sold_ratio_triggered"):
-        if sold_ratio >= 50:
-            print(f"  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE")
-            success, tx = sell_token(ca, ticker, 1.0, "SOLD_RATIO_EXIT")
-            if success:
-                cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
-                cancel_limit_order(ca, ticker, pos.get("sl_strategy_id", ""), "SL")
-                record_trade_close(ca, "SOLD_RATIO_EXIT", pnl_pct)
-                del state["positions"][ca]
-                _now = datetime.now(timezone(timedelta(hours=8)))
-                state["cooldowns"][ca] = (
-                    _now + timedelta(hours=COOLDOWN_AFTER_SL)
-                ).isoformat()
-                save_state(state)
-                return True
-        elif sold_ratio >= 30:
-            print(f"  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> reduce 50%")
-            success, tx = sell_token(ca, ticker, 0.5, "SOLD_RATIO_REDUCE")
-            if success:
-                pos["sold_ratio_triggered"] = True
-                pos["sl_price"] = max(float(pos.get("sl_price", 0)), float(pos.get("entry_price", 0)))
-                save_state(state)
 
     return False
 
