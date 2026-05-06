@@ -2818,6 +2818,24 @@ def check_positions(positions, state=None):
 
             ok, _ = execute_sell(chain, ca, token_bal)
 
+        else:
+
+            log(f'  {sym}: balance=0, cleaning dead position')
+
+            entry_price = float(pos.get('entry_price', 0) or 0)
+
+            current_price = float(pos.get('current_price', entry_price))
+
+            exit_pnl = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+
+            _save_trade_history(state, pos, current_price, exit_pnl, f'{reason}_dead', 0)
+
+            del positions[ca]
+
+            save_state()
+
+            continue
+
 
             if ok:
 
