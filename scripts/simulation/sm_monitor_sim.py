@@ -159,7 +159,7 @@ POSITION_STALE_HOURS = 72  # ?2h
 
 
 
-DRY_RUN = False  # ?
+DRY_RUN = True  # SIMULATION: never execute real trades
 
 ONCE = '--once' in sys.argv
 
