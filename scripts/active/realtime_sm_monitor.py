@@ -432,7 +432,10 @@ def calc_buy_size(state):
             bal = float(p.get('balance', 0) or 0)
             pnl = float(p.get('pnl_pct', 0) or 0)
             remaining = 1.0 - float(p.get('sold_pct', 0))
-            if ep > 0 and bal > 0:
+            eusd = float(p.get('entry_usd_amount', 0) or 0)
+            if eusd > 0:
+                pos_value += eusd * remaining * (1 + pnl)
+            elif ep > 0 and bal > 0:
                 pos_value += p.get('entry_usd_amount', BUY_SIZE_USDT) * remaining * (1 + pnl)
 
         account_total = usdt_total + pos_value
@@ -2404,6 +2407,18 @@ def process_new_trades(trades, state, wallets):
                             log(f'WARN: {sym} TP limit order failed, position unprotected')
 
 
+                # Store actual balance after buy
+                if chain == 'bsc' and not DRY_RUN:
+                    try:
+                        bal_now = get_balance_bsc()
+                        pos_data['balance'] = bal_now.get(ca.lower(), 0)
+                    except: pass
+                elif chain == 'solana' and not DRY_RUN:
+                    try:
+                        time.sleep(2)
+                        bal_now = get_balance('solana')
+                        pos_data['balance'] = bal_now.get(ca.lower(), 0)
+                    except: pass
                 positions[ca] = pos_data
                 # Record in trade_history for dedup (cross-cycle protection)
                 state.setdefault('trade_history', []).append({
