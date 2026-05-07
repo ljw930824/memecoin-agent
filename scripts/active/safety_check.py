@@ -228,10 +228,10 @@ def check_solana(token_ca, trade_amount_usd=5.0):
         total = s_hp + s_tax + s_imp + s_liq + s_holder
         errors = [x for x in [e_hp, e_tax, e_imp, e_liq] if x]
 
-        # 硬性拒绝: honeypot
+        # 蜜罐降权而非硬拒绝（API 的 isHonePot 对低流动性 Solana token 不可靠）
+        # score_honeypot 已给 0 分，不再额外 hard reject
         if is_hp:
-            total = 0
-            errors = ['HONEYPOT']
+            errors.append('HP_FLAG')
 
         details = {
             'chain': 'Solana',
@@ -249,7 +249,7 @@ def check_solana(token_ca, trade_amount_usd=5.0):
             },
         }
 
-        passed = total >= MIN_SAFETY_SCORE and not is_hp
+        passed = total >= MIN_SAFETY_SCORE  # 蜜罐标记已降权，不额外硬拒绝
         return round(total, 1), passed, details, errors
 
     except Exception as e:
@@ -315,9 +315,9 @@ def check_bsc(token_ca, trade_amount_usd=5.0):
         total = s_hp + s_tax + s_imp + s_liq + s_holder
         errors = [x for x in [e_hp, e_tax, e_imp, e_liq] if x]
 
+        # 蜜罐降权而非硬拒绝（同 Solana 逻辑）
         if is_hp:
-            total = 0
-            errors = ['HONEYPOT']
+            errors.append('HP_FLAG')
 
         details = {
             'chain': 'BSC',
@@ -334,7 +334,7 @@ def check_bsc(token_ca, trade_amount_usd=5.0):
             },
         }
 
-        passed = total >= MIN_SAFETY_SCORE and not is_hp
+        passed = total >= MIN_SAFETY_SCORE  # 蜜罐标记已降权，不额外硬拒绝
         return round(total, 1), passed, details, errors
 
     except Exception as e:

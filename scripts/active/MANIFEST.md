@@ -11,7 +11,7 @@
 | execute_bsc.py | v3.3 | BSC 执行（sold_ratio 修复、动态 SL/TP、队列刷新 soldRatio、锁态 state） | scalper_orchestrator.py |
 | execute_solana.py | v3.3 | Solana 执行（链匹配 CT_501/solana、动态风险档位、锁态 state） | scalper_orchestrator.py |
 | scalper_orchestrator.py | v1.1 | 编排器：BSC 异常隔离，Solana 仍执行 | SmartMoneyUnified (禁用) |
-| safety_check.py | v1.1 | 买入前安全检查（OKX 无硬编码、quote JSON 宽松解析、流动性 NaN 防护） | execute_bsc/solana |
+| safety_check.py | v1.2 | 买入前安全检查（蜜罐降权非硬拒绝、OKX 无硬编码、quote JSON 宽松解析、流动性 NaN 防护） | execute_bsc/solana |
 | backtest_analysis.py | v2 | 回测分析（soldRatio+tracker 盈亏） | 手动运行 |
 | realtime_sm_monitor.py | v2.1 | 实验跟单（OKX 无硬编码、BSC TP 告警仅失败时） | 手动运行 |
 | tests/test_plan_regressions.py | v1 | 契约与动态风控单元测试 | 手动 `python -m unittest` |
