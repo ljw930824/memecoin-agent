@@ -671,37 +671,51 @@ def reconcile_wallet(state):
 
     wallet_tokens = {}
 
-    # Solana - use BAW CLI (onchainos API has stale cache)
+    # Solana - use OnChainOS wallet balance API (BAW CLI不支持Solana)
 
     try:
 
-        sol_out = subprocess.run([BAW_CMD, 'wallet', 'balance', '--binanceChainId', 'CT_501', '--json'],
+        for attempt in range(3):
 
-                                 capture_output=True, text=True, timeout=15)
+            sol_out, sol_code = oc_run(['onchainos', 'wallet', 'balance', '--chain', 'solana'], timeout=25)
 
-        if sol_out.returncode == 0:
+            if sol_code == 0 and sol_out:
 
-            sol_d = parse_json(sol_out.stdout)
+                sol_d = parse_json(sol_out)
 
-            if sol_d and sol_d.get('success'):
+                if sol_d and sol_d.get('ok'):
 
-                for item in sol_d.get('data', []):
+                    details = sol_d.get('data', {}).get('details', [])
 
-                    sym = item.get('symbol', '?')
+                    for detail in details:
 
-                    bal = float(item.get('balance', 0) or 0)
+                        for ta in detail.get('tokenAssets', []):
 
-                    addr = item.get('address', '')
+                            if str(ta.get('chainIndex', '')) != '501':
 
-                    price = float(item.get('price', 0) or 0)
+                                continue
 
-                    if addr and bal > 0.01 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL'):
+                            sym = ta.get('tokenSymbol', '?')
 
-                        wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': price, 'chain': 'solana'}
+                            bal = float(ta.get('balance', 0) or 0)
+
+                            addr = ta.get('tokenAddress', '')
+
+                            price = float(ta.get('tokenPrice', 0) or 0)
+
+                            if addr and bal > 0.01 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL'):
+
+                                wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': price, 'chain': 'solana'}
+
+                    break  # success
+
+            if attempt < 2:
+
+                time.sleep(2 * (attempt + 1))
 
     except Exception as e:
 
-        log('reconcile: solana baw fail: ' + str(e))
+        log('reconcile: solana onchainos fail: ' + str(e))
 
 
     # BSC
@@ -1343,39 +1357,101 @@ def get_balance(chain='solana'):
 
         return get_balance_bsc()
 
-    # Use BAW CLI (onchainos API returns stale cache)
+    # Solana - use OnChainOS wallet balance API (with Solana RPC fallback)
+
+    result = {}
+
+    # Try OnChainOS first
 
     try:
 
-        sol_out = subprocess.run([BAW_CMD, 'wallet', 'balance', '--binanceChainId', 'CT_501', '--json'],
+        for attempt in range(3):
 
-                                 capture_output=True, text=True, timeout=15)
+            sol_out, sol_code = oc_run(['onchainos', 'wallet', 'balance', '--chain', 'solana'], timeout=25)
 
-        if sol_out.returncode == 0:
+            if sol_code == 0 and sol_out:
 
-            sol_d = parse_json(sol_out.stdout)
+                sol_d = parse_json(sol_out)
 
-            if sol_d and sol_d.get('success'):
+                if sol_d and sol_d.get('ok'):
 
-                result = {}
+                    details = sol_d.get('data', {}).get('details', [])
 
-                for item in sol_d.get('data', []):
+                    for detail in details:
 
-                    bal = float(item.get('balance', 0) or 0)
+                        for ta in detail.get('tokenAssets', []):
 
-                    addr = item.get('address', '') or item.get('tokenAddress', '')
+                            if str(ta.get('chainIndex', '')) != '501':
 
-                    if addr and bal > 0 and addr != 'So11111111111111111111111111111111111111111':
+                                continue
 
-                        result[addr] = bal
+                            bal = float(ta.get('balance', 0) or 0)
 
-                return result
+                            addr = ta.get('tokenAddress', '')
+
+                            if addr and bal > 0 and addr != 'So11111111111111111111111111111111111111111':
+
+                                result[addr] = bal
+
+                    if result:
+
+                        return result
+
+                    break  # API returned OK but no tokens
+
+            if attempt < 2:
+
+                time.sleep(2 * (attempt + 1))
 
     except Exception as e:
 
-        log('get_balance solana baw fail: ' + str(e))
+        log('get_balance solana onchainos fail: ' + str(e))
 
-    return {}
+    # Fallback: Solana RPC direct query
+
+    if not result and WALLET:
+
+        try:
+
+            rpc_payload = json.dumps({
+
+                'jsonrpc': '2.0', 'id': 1,
+
+                'method': 'getTokenAccountsByOwner',
+
+                'params': [WALLET, {'programId': 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'}, {'encoding': 'jsonParsed'}]
+
+            }).encode('utf-8')
+
+            req = __import__('urllib.request', fromlist=['Request', 'urlopen'])
+
+            r = req.Request('https://api.mainnet-beta.solana.com', data=rpc_payload,
+
+                           headers={'Content-Type': 'application/json'}, method='POST')
+
+            with req.urlopen(r, timeout=15) as resp:
+
+                rpc_data = json.loads(resp.read().decode('utf-8'))
+
+            for v in rpc_data.get('result', {}).get('value', []):
+
+                info = v.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+
+                mint = info.get('mint', '')
+
+                ui = info.get('tokenAmount', {})
+
+                bal = float(ui.get('uiAmount', 0) or 0)
+
+                if mint and bal > 0 and mint != 'So11111111111111111111111111111111111111111':
+
+                    result[mint] = bal
+
+        except Exception as e:
+
+            log('get_balance solana rpc fail: ' + str(e))
+
+    return result
 
 
 

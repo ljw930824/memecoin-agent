@@ -913,13 +913,13 @@ def record_trade_close(ca, reason, pnl_pct):
     # v3.2: Track consecutive SL for freeze
     risk_check = state.setdefault("risk_check", {})
     if reason == "SL_HIT":
-        risk_check["consecutive_sl"] = risk_check.get("consecutive_sl", 0) + 1
-        if risk_check["consecutive_sl"] >= CONSECUTIVE_SL_FREEZE:
+        risk_check["bsc_consecutive_sl"] = risk_check.get("bsc_consecutive_sl", 0) + 1
+        if risk_check["bsc_consecutive_sl"] >= CONSECUTIVE_SL_FREEZE:
             freeze_until = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=FREEZE_DURATION_HOURS)).isoformat()
-            risk_check["freeze_until"] = freeze_until
+            risk_check["bsc_freeze_until"] = freeze_until
             print(f"  [RISK] {risk_check['consecutive_sl']} consecutive SL -> FROZEN until {freeze_until}")
     elif "TP" in reason:
-        risk_check["consecutive_sl"] = 0
+        risk_check["bsc_consecutive_sl"] = 0
     state["risk_check"] = risk_check
 
     # v3.2: Update daily P&L
@@ -943,7 +943,7 @@ def main():
 
     # ─── v3.2: Risk check ───
     risk_check = state.get("risk_check", {})
-    freeze_until = risk_check.get("freeze_until")
+    freeze_until = risk_check.get("bsc_freeze_until")
     if freeze_until:
         try:
             freeze_dt = datetime.fromisoformat(freeze_until)
@@ -953,7 +953,7 @@ def main():
                 return
             else:
                 risk_check["freeze_until"] = None
-                risk_check["consecutive_sl"] = 0
+                risk_check["bsc_consecutive_sl"] = 0
                 state["risk_check"] = risk_check
         except Exception:
             pass

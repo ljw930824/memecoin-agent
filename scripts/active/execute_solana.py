@@ -37,6 +37,13 @@ TAKE_PROFIT_PCT = 0.12
 COOLDOWN_SL    = 12
 COOLDOWN_TP    = 6
 
+# Ladder TP (matching BSC execute_bsc.py v3.2)
+LADDER_TP        = [0.30, 1.00, 3.00]   # +30%, +100%, +300%
+LADDER_RATIOS    = [0.77, 0.50, 0.50]   # sell ratios at each level
+SM_SELL_FOLLOW   = 3                    # sell if 3+ SM wallets sell
+SOLD_RATIO_EXIT_THRESH   = 50           # full close if soldRatio >= 50%
+SOLD_RATIO_REDUCE_THRESH = 30           # reduce 50% if soldRatio >= 30%
+
 # v3.2 Risk Management
 MAX_DAILY_LOSS_PCT      = 0.15   # Max daily drawdown -15%
 CONSECUTIVE_SL_FREEZE   = 3      # 3 consecutive SL -> freeze trading
@@ -461,7 +468,7 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
             pos['partial_tp_15'] = True
             pos['sl_price'] = max(float(pos['sl_price']), ep * 1.03)
             pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
-    if pnl_pct >= 0.08 and not pos.get('breakeven_done'):
+    if pnl_pct >= 0.05 and not pos.get('breakeven_done'):
         pos['sl_price'] = max(float(pos['sl_price']), ep)
         pos['breakeven_done'] = True
     # Trailing stop: after breakeven, track SL 2% below peak
@@ -493,10 +500,44 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
         except Exception:
             pass
 
+    # ─── Ladder TP (matching BSC v3.2) ───
+    ladder_step = pos.get('ladder_step', 0)
+    if ladder_step < len(LADDER_TP) and pnl_pct >= LADDER_TP[ladder_step]:
+        ratio = LADDER_RATIOS[ladder_step] if ladder_step < len(LADDER_RATIOS) else 0.5
+        print(f'  [LADDER] {ticker} +{pnl_pct*100:.1f}% -> sell {ratio*100:.0f}% (step {ladder_step+1})')
+        success, _ = sell_token(ca, ticker, ratio, f'LADDER_TP{ladder_step}')
+        if success:
+            pos['ladder_step'] = ladder_step + 1
+            pos['sold_pct'] = float(pos.get('sold_pct', 0)) + ratio
+            remaining_amt = float(pos.get('invest_amount', 0)) * (1.0 - ratio)
+            pos['invest_amount'] = remaining_amt
+            if float(pos.get('sold_pct', 0)) >= 0.99:
+                record_close(ca, f'LADDER_TP{ladder_step}', pnl_pct)
+                del state['positions'][ca]
+                save_state(state)
+                return True
+            # First ladder step: move SL to breakeven
+            if ladder_step == 0:
+                pos['sl_price'] = max(float(pos.get('sl_price', 0)), ep)
+            save_state(state)
+        return False
+
+    # ─── SM sell follow ───
+    sm_sells = pos.get('sm_sells', 0)
+    if sm_sells >= SM_SELL_FOLLOW and not pos.get('sm_sell_done'):
+        print(f'  [SM SELL] {ticker} sm_sells={sm_sells} -> FULL CLOSE')
+        success, _ = sell_token(ca, ticker, 1.0, 'SM_SELL_FOLLOW')
+        if success:
+            pos['sm_sell_done'] = True
+            record_close(ca, 'SM_SELL_FOLLOW', pnl_pct)
+            del state['positions'][ca]
+            save_state(state)
+            return True
+
     # soldRatio-based exit: smart money reducing -> reduce position
     sold_ratio = pos.get('sold_ratio', 0)
     if sold_ratio > 0 and not pos.get('sold_ratio_triggered'):
-        if sold_ratio >= 50:
+        if sold_ratio >= SOLD_RATIO_EXIT_THRESH:
             print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE')
             success, _ = sell_token(ca, ticker, 1.0, 'SOLD_RATIO_EXIT')
             if success:
@@ -505,12 +546,14 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
                 state['cooldowns'][ca] = (now + timedelta(hours=COOLDOWN_SL)).isoformat()
                 save_state(state)
                 return True
-        elif sold_ratio >= 30:
+        elif sold_ratio >= SOLD_RATIO_REDUCE_THRESH:
             print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> reduce 50%')
             success, _ = sell_token(ca, ticker, 0.5, 'SOLD_RATIO_REDUCE')
             if success:
                 pos['sold_ratio_triggered'] = True
                 pos['sl_price'] = max(float(pos.get('sl_price', 0)), float(pos.get('entry_price', 0)))
+                pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
+                save_state(state)
                 save_state(state)
     return False
 
@@ -538,13 +581,13 @@ def record_close(ca, reason, pnl_pct):
     # v3.2: Track consecutive SL for freeze
     risk_check = state.setdefault("risk_check", {})
     if reason == "SL_HIT":
-        risk_check["consecutive_sl"] = risk_check.get("consecutive_sl", 0) + 1
-        if risk_check["consecutive_sl"] >= CONSECUTIVE_SL_FREEZE:
+        risk_check["sol_consecutive_sl"] = risk_check.get("sol_consecutive_sl", 0) + 1
+        if risk_check["sol_consecutive_sl"] >= CONSECUTIVE_SL_FREEZE:
             freeze_until = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=FREEZE_DURATION_HOURS)).isoformat()
-            risk_check["freeze_until"] = freeze_until
+            risk_check["sol_freeze_until"] = freeze_until
             print(f"  [RISK] {risk_check['consecutive_sl']} consecutive SL -> FROZEN until {freeze_until}")
     elif "TP" in reason:
-        risk_check["consecutive_sl"] = 0
+        risk_check["sol_consecutive_sl"] = 0
     state["risk_check"] = risk_check
 
     # v3.2: Update daily P&L
@@ -627,7 +670,7 @@ def main():
     print('='*50)
     # ─── v3.2: Risk check ───
     risk_check = state.get("risk_check", {})
-    freeze_until = risk_check.get("freeze_until")
+    freeze_until = risk_check.get("sol_freeze_until")
     if freeze_until:
         try:
             freeze_dt = datetime.fromisoformat(freeze_until)
@@ -637,7 +680,7 @@ def main():
                 return
             else:
                 risk_check["freeze_until"] = None
-                risk_check["consecutive_sl"] = 0
+                risk_check["sol_consecutive_sl"] = 0
                 state["risk_check"] = risk_check
         except Exception:
             pass
