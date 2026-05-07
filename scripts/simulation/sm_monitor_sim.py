@@ -1,4 +1,4 @@
-﻿"""
+"""
 
 
 realtime_sm_monitor.py v3.3 ??(Bug ?
@@ -39,6 +39,16 @@ from collections import defaultdict
 
 
 sys.stdout.reconfigure(encoding='utf-8')
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+try:
+    from safety_check import check_token, format_safety_report
+    _HAS_SAFETY = True
+except ImportError:
+    _HAS_SAFETY = False
 
 
 
@@ -2285,6 +2295,16 @@ def process_new_trades(trades, state, wallets):
                 continue
 
             dynamic_buy = calc_buy_size(state)
+
+            if _HAS_SAFETY and not DRY_RUN:
+                s_score, s_passed, s_details, s_errors = check_token(chain, ca, dynamic_buy)
+                if not s_passed:
+                    reason = ', '.join(s_errors) if s_errors else 'low_score'
+                    log(f'SKIP {sym}: SAFETY FAIL ({reason}, score={s_score})')
+                    continue
+                log(f'Safety OK: {sym} score={s_score} hp={s_details.get("is_honeypot", "?")}')
+            elif not _HAS_SAFETY:
+                log('WARN: safety_check module not available')
 
             ok, tx = execute_buy(chain, ca, dynamic_buy)
 

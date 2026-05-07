@@ -35,12 +35,20 @@ try:
 except ImportError:
     okx_env_for_subprocess = None  # type: ignore
 
+# Safety check module (honeypot/tax/liquidity pre-buy check)
+try:
+    from safety_check import check_token, format_safety_report
+    _HAS_SAFETY = True
+except ImportError:
+    _HAS_SAFETY = False
+
 # ===  ===
 
 BASE = os.path.join(os.path.expanduser('~'), '.qclaw', 'workspace')
 
 DATA = os.path.join(BASE, 'data')
 
+BAW_CMD = os.path.expanduser(os.path.join('~', 'AppData', 'Roaming', 'QClaw', 'npm-global', 'baw.cmd')) if sys.platform == 'win32' else 'baw'
 WALLET = '77BP1JzBARGaQ8eJWj6B1RYvaB4zRxU7Nx7BDYdgLCAa'
 
 USDT_SOL = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
@@ -663,33 +671,38 @@ def reconcile_wallet(state):
 
     wallet_tokens = {}
 
-    # Solana
+    # Solana - use BAW CLI (onchainos API has stale cache)
 
     try:
 
-        out, _ = oc_run(['onchainos', 'portfolio', 'all-balances', '--address', WALLET, '--chains', 'solana', '--chain', 'solana'])
+        sol_out = subprocess.run([BAW_CMD, 'wallet', 'balance', '--binanceChainId', 'CT_501', '--json'],
 
-        d = parse_json(out)
+                                 capture_output=True, text=True, timeout=15)
 
-        if d:
+        if sol_out.returncode == 0:
 
-            for t in d.get('data', [{}])[0].get('tokenAssets', []):
+            sol_d = parse_json(sol_out.stdout)
 
-                bal = float(t.get('balance', 0))
+            if sol_d and sol_d.get('success'):
 
-                ca = t.get('tokenContractAddress', '')
+                for item in sol_d.get('data', []):
 
-                sym = t.get('symbol', '?')
+                    sym = item.get('symbol', '?')
 
-                price = float(t.get('tokenPrice', 0) or 0)
+                    bal = float(item.get('balance', 0) or 0)
 
-                if bal > 0.01 and ca and sym not in ('USDT', 'USDC', 'SOL', 'wSOL'):
+                    addr = item.get('address', '')
 
-                    wallet_tokens[ca] = {'symbol': sym, 'balance': bal, 'price': price, 'chain': 'solana'}
+                    price = float(item.get('price', 0) or 0)
+
+                    if addr and bal > 0.01 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL'):
+
+                        wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': price, 'chain': 'solana'}
 
     except Exception as e:
 
-        log('reconcile: solana fail: ' + str(e))
+        log('reconcile: solana baw fail: ' + str(e))
+
 
     # BSC
 
@@ -1330,33 +1343,39 @@ def get_balance(chain='solana'):
 
         return get_balance_bsc()
 
-    out, _ = oc_run([
+    # Use BAW CLI (onchainos API returns stale cache)
 
-        'onchainos', 'portfolio', 'all-balances',
+    try:
 
-        '--address', WALLET, '--chains', chain, '--chain', chain
+        sol_out = subprocess.run([BAW_CMD, 'wallet', 'balance', '--binanceChainId', 'CT_501', '--json'],
 
-    ])
+                                 capture_output=True, text=True, timeout=15)
 
-    d = parse_json(out)
+        if sol_out.returncode == 0:
 
-    if not d or not d.get('ok'):
+            sol_d = parse_json(sol_out.stdout)
 
-        return {}
+            if sol_d and sol_d.get('success'):
 
-    result = {}
+                result = {}
 
-    for asset in d.get('data', [{}])[0].get('tokenAssets', []):
+                for item in sol_d.get('data', []):
 
-        bal = float(asset.get('balance', 0))
+                    bal = float(item.get('balance', 0) or 0)
 
-        ca = asset.get('tokenContractAddress', '')
+                    addr = item.get('address', '') or item.get('tokenAddress', '')
 
-        if bal > 0 and ca:
+                    if addr and bal > 0 and addr != 'So11111111111111111111111111111111111111111':
 
-            result[ca] = bal
+                        result[addr] = bal
 
-    return result
+                return result
+
+    except Exception as e:
+
+        log('get_balance solana baw fail: ' + str(e))
+
+    return {}
 
 
 
@@ -1682,6 +1701,17 @@ def process_new_trades(trades, state, wallets):
                     log(f'SKIP {sym}: already bought by BAW (shared dedup)')
                     continue
 
+
+            # Pre-buy safety check (honeypot, tax, liquidity)
+            if _HAS_SAFETY and not DRY_RUN:
+                s_score, s_passed, s_details, s_errors = check_token(chain, ca, dynamic_buy)
+                if not s_passed:
+                    reason = ', '.join(s_errors) if s_errors else 'low_score'
+                    log(f'SKIP {sym}: SAFETY FAIL ({reason}, score={s_score})')
+                    continue
+                log(f'Safety OK: {sym} score={s_score} hp={s_details.get("is_honeypot", "?")}')
+            elif not _HAS_SAFETY:
+                log('WARN: safety_check module not available')
             ok, tx = execute_buy(chain, ca, dynamic_buy)
 
             if ok:
@@ -2326,4 +2356,3 @@ def main():
 if __name__ == '__main__':
 
     main()
-
