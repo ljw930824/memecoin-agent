@@ -829,6 +829,8 @@ def load_wallets():
                 wins = info.get('wins', 0)
                 losses = info.get('losses', 0)
                 total = wins + losses
+                # Keep recent_trades but truncate (update_wallet_stats needs it)
+                trades = info.get('recent_trades', [])
                 slim[addr] = {
                     'addr': addr,
                     'wins': wins,
@@ -836,6 +838,7 @@ def load_wallets():
                     'total': total,
                     'winrate': round(wins / total, 3) if total > 0 else 0,
                     'total_pnl': info.get('total_pnl', 0),
+                    'recent_trades': trades[-10:] if len(trades) > 10 else trades,
                 }
             else:
                 slim[addr] = info
@@ -3263,9 +3266,24 @@ def main():
 
         while True:
 
-
-            run_once(state, wallets)
-
+            try:
+                run_once(state, wallets)
+            except Exception as e:
+                import traceback
+                log(f'ERROR in run_once: {e}')
+                traceback.print_exc()
+                try:
+                    save_state(state)
+                    save_wallets(wallets)
+                except:
+                    pass
+                try:
+                    wallets = load_wallets()
+                except:
+                    pass
+                log(f'Retrying in {TRACKER_POLL_SEC * 3}s...')
+                time.sleep(TRACKER_POLL_SEC * 3)
+                continue
 
             log(f'--- sleep {TRACKER_POLL_SEC}s ---')
 

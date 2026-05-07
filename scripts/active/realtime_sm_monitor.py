@@ -2479,9 +2479,27 @@ def main():
 
         while True:
 
-            run_once(state, wallets)
+            try:
+                run_once(state, wallets)
+            except Exception as e:
+                import traceback
+                log(f'ERROR in run_once: {e}')
+                traceback.print_exc()
+                try:
+                    save_state(state)
+                    save_wallets(wallets)
+                except:
+                    pass
+                try:
+                    wallets = load_wallets()
+                except:
+                    pass
+                log(f'Retrying in {TRACKER_POLL_SEC * 3}s...')
+                time.sleep(TRACKER_POLL_SEC * 3)
+                continue
 
             log(f'--- sleep {TRACKER_POLL_SEC}s ---')
+
 
             time.sleep(TRACKER_POLL_SEC)
 
