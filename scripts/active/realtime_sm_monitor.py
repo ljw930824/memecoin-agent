@@ -23,6 +23,15 @@ from datetime import datetime, timezone, timedelta
 
 from collections import defaultdict
 
+# Auto-archive integration
+import sys as _sys_a
+_sys_a.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "archive"))
+try:
+    from data_archive_manager import auto_archive, on_sell_closed
+    _ARCHIVE_OK = True
+except ImportError:
+    _ARCHIVE_OK = False
+
 
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -422,7 +431,8 @@ def check_risk_limits(state):
 
 def log(msg):
 
-    ts = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
+    ts = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+    _rotate_log_if_needed()
 
     line = f'[{ts}] {msg}'
 
@@ -440,6 +450,37 @@ def log(msg):
 
 
 
+LOG_ROTATE_SIZE = 5 * 1024 * 1024  # 5MB
+
+def _rotate_log_if_needed():
+    """Rotate log file if exceeds LOG_ROTATE_SIZE. Archive old to archive/logs/."""
+    try:
+        if not os.path.exists(LOG_FILE):
+            return
+        if os.path.getsize(LOG_FILE) < LOG_ROTATE_SIZE:
+            return
+        # Archive current log
+        log_dir = os.path.join(DATA, "archive", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_name = os.path.join(log_dir, f"sm_trade-log_{ts}.txt")
+        os.rename(LOG_FILE, archive_name)
+        # Decay old archived logs (keep 30 days)
+        _decay_old_logs(log_dir)
+    except Exception:
+        pass
+
+def _decay_old_logs(log_dir, max_age_days=30):
+    """Remove archived log files older than max_age_days."""
+    try:
+        cutoff = time.time() - max_age_days * 86400
+        for fn in os.listdir(log_dir):
+            if fn.startswith("sm_trade-log_") and fn.endswith(".txt"):
+                fp = os.path.join(log_dir, fn)
+                if os.path.getmtime(fp) < cutoff:
+                    os.remove(fp)
+    except Exception:
+        pass
 def parse_json(raw):
 
     m = re.search(r'\{.*\}', raw, re.DOTALL)
@@ -606,6 +647,22 @@ def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0
     state['trade_history'] = state['trade_history'][-500:]
     sym = pos.get('symbol', '?')
     log(f'trade_history: {sym} closed pnl={exit_pnl_pct:+.1%} hold={hold_hours}h reason={reason}')
+    # Archive closed position to daily file
+    if _ARCHIVE_OK:
+        try:
+            on_sell_closed({
+                'token_address': pos.get('token_address', pos.get('ca', '')),
+                'chain': pos.get('chain', 'unknown'),
+                'buy_time': pos.get('buy_time', ''),
+                'last_sell_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'pnl_pct': exit_pnl_pct,
+                'symbol': pos.get('symbol', '?'),
+                'reason': reason,
+                'exit_usd': exit_usd,
+                'hold_hours': hold_hours,
+            })
+        except Exception:
+            pass
 
 def save_state(state):
 
@@ -2365,6 +2422,15 @@ def run_once(state, wallets):
     else:
 
         log(f'No positions (wallets tracked: {len(wallets)})')
+
+    # Auto-archive: decay backups, archive closed positions
+    if _ARCHIVE_OK:
+        try:
+            _ar = auto_archive(state_file=STATE_FILE)
+            if _ar:
+                log(f'[ARCHIVE] {_ar}')
+        except Exception:
+            pass
 
     return positions
 
