@@ -118,6 +118,9 @@ LOG_FILE = os.path.join(DATA, 'sm_trade-log_dryrun.txt')
 
 WALLET_FILE = os.path.join(DATA, 'sm_wallets.json')
 
+SHARED_DEDUP_FILE = os.path.join(DATA, 'shared_bought.json')
+SHARED_DEDUP_TTL = 3600
+
 
 
 
@@ -153,6 +156,8 @@ SL_PCT = -0.08
 
 
 SM_SELL_FOLLOW = 3
+CONSEC_SL_LIMIT = 3
+CONSEC_SL_FREEZE_SEC = 7200
 
 
 TRACKER_POLL_SEC = 10
@@ -372,6 +377,12 @@ LADDER_RATIOS = [0.77, 0.50, 0.50]
 
 TIME_TIERS = [
 
+    # (hold_hours, SL PnL, TP PnL, sell_pct, label)
+
+    # breakeven: at +5% sell ~77% to recover cost
+    (0,   None, 0.05,  0.77, 'breakeven'),
+
+
 
     # (hold_hours, ? PnL, , )
 
@@ -472,6 +483,14 @@ def check_risk_limits(state):
         from datetime import datetime
         pu = datetime.fromtimestamp(pause_until).strftime('%m-%d %H:%M')
         return False, f'monthly pause until {pu}'
+    # Consecutive SL freeze check
+    consec_sl = state.get('consec_sl', 0)
+    freeze_until = state.get('consec_sl_freeze_until', 0)
+    if freeze_until and now < freeze_until:
+        from datetime import datetime
+        fu = datetime.fromtimestamp(freeze_until).strftime('%m-%d %H:%M')
+        return False, f'consec SL freeze until {fu}'
+
     realized_daily = 0.0
     realized_monthly = 0.0
     for t in state.get('trade_history', []):
@@ -635,6 +654,42 @@ def load_state():
 
 
 
+
+
+def _load_shared_dedup():
+    try:
+        if os.path.exists(SHARED_DEDUP_FILE):
+            with open(SHARED_DEDUP_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+
+def _save_shared_dedup(data):
+    try:
+        with open(SHARED_DEDUP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except:
+        pass
+
+
+def _check_shared_dedup(ca):
+    now = int(time.time())
+    dedup = _load_shared_dedup()
+    entry = dedup.get(ca, {})
+    if entry and (now - entry.get('ts', 0)) < SHARED_DEDUP_TTL:
+        return True
+    return False
+
+
+def _record_shared_dedup(ca, chain, sym):
+    now = int(time.time())
+    dedup = _load_shared_dedup()
+    dedup[ca] = {'ts': now, 'chain': chain, 'sym': sym}
+    cutoff = now - SHARED_DEDUP_TTL * 2
+    dedup = {k: v for k, v in dedup.items() if v.get('ts', 0) > cutoff}
+    _save_shared_dedup(dedup)
 def reload_positions_if_external_change(state):
     """If state file was modified externally (mtime changed), reload positions."""
     global _STATE_FILE_MTIME
@@ -768,6 +823,20 @@ def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0
     state['trade_history'] = state['trade_history'][-500:]
     sym = pos.get('symbol', '?')
     log(f'trade_history: {sym} closed pnl={exit_pnl_pct:+.1%} hold={hold_hours}h reason={reason}')
+    # Track consecutive stop losses
+    if reason == 'stop_loss':
+        state['consec_sl'] = state.get('consec_sl', 0) + 1
+        cs = state['consec_sl']
+        if cs >= CONSEC_SL_LIMIT:
+            state['consec_sl_freeze_until'] = int(time.time()) + CONSEC_SL_FREEZE_SEC
+            log(f'CONSEC SL: {cs} losses -> freeze 2h')
+        else:
+            log(f'CONSEC SL: {cs}/{CONSEC_SL_LIMIT}')
+    elif reason not in ('dead_position',):
+        if state.get('consec_sl', 0) > 0:
+            log('CONSEC SL reset')
+        state['consec_sl'] = 0
+        state['consec_sl_freeze_until'] = 0
     # Archive closed position to daily file
     if _ARCHIVE_OK:
         try:
@@ -2039,6 +2108,23 @@ def execute_buy(chain, token_ca, amount_usdt):
 
 
 
+
+
+def _check_sold_ratio(chain, ca):
+    """Check soldRatio from onchainos API."""
+    try:
+        r = subprocess.run(
+            ['onchainos', 'token', 'price-info', '--address', ca, '--chain', chain],
+            capture_output=True, timeout=8, encoding='utf-8', errors='replace'
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout.strip())
+            sr = data.get('soldRatio')
+            if sr is not None:
+                return float(sr)
+    except:
+        pass
+    return None
 def execute_sell(chain, token_ca, token_balance):
 
 
@@ -2270,6 +2356,11 @@ def process_new_trades(trades, state, wallets):
             log(f'SKIP {sym}: recently traded (cooldown)')
             continue
 
+            # Cross-chain dedup
+            if _check_shared_dedup(ca):
+                log(f'SKIP {sym}: cross-chain dedup')
+                continue
+
         if act['buys'] > 0:
 
 
@@ -2329,6 +2420,18 @@ def process_new_trades(trades, state, wallets):
 
 
 
+
+            # soldRatio check
+            sr = _check_sold_ratio(chain, ca)
+            if sr is not None:
+                if sr >= 0.50:
+                    log(f'SKIP {sym}: soldRatio={sr:.0%} (holder dump)')
+                    continue
+                elif sr >= 0.30:
+                    log(f'WARN {sym}: soldRatio={sr:.0%} (penalty)')
+                    if good_buyers < MIN_CONSENSUS_WALLETS + 1:
+                        log(f'SKIP {sym}: soldRatio penalty')
+                        continue
 
             entry_price = get_token_price_usd(chain, ca)
 
@@ -2460,6 +2563,8 @@ def process_new_trades(trades, state, wallets):
                     except: pass
                 positions[ca] = pos_data
                 # Record in trade_history for dedup (cross-cycle protection)
+                _record_shared_dedup(ca, chain, sym)
+
                 state.setdefault('trade_history', []).append({
                     'contract_address': ca, 'symbol': sym, 'reason': 'sm_buy',
                     'ts': int(time.time()), 'amount_usd': dynamic_buy, 'chain': chain
