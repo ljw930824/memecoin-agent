@@ -1825,7 +1825,7 @@ def process_new_trades(trades, state, wallets):
 
         sym = lat.get('tokenSymbol', '?')
 
-        mcap = float(lat.get('marketCap', 0))
+        mcap = float(lat.get('marketCap') or 0)
 
         chain_idx = str(lat.get('chainIndex', ''))
 
