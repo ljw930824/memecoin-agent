@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 execute_bsc.py - BSC Chain Executor
 - 只执行 BSC 信号（chain 56）
@@ -25,7 +25,7 @@ from qclaw_trading_common import (
 )
 
 DATA_DIR    = os.path.expanduser("~/.qclaw/workspace/data")
-STATE_FILE  = os.path.join(DATA_DIR, "smart-money-state.json")
+STATE_FILE  = os.path.join(DATA_DIR, "smart-money-bsc-state.json")
 QUEUE_FILE  = os.path.join(DATA_DIR, "signal-queue.json")
 SHARED_DEDUP = os.path.join(DATA_DIR, "shared_bought.json")
 RETRY_LOG   = os.path.join(DATA_DIR, "retry-log.txt")
@@ -95,10 +95,14 @@ def _shared_dedup_load():
     if os.path.exists(SHARED_DEDUP):
         try:
             with open(SHARED_DEDUP, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict):
+                    return [data.get(k, v) if isinstance(v, dict) else {'ca': k, **v} for k, v in data.items()]
         except Exception:
             pass
-    return {}
+    return []
 
 def _shared_dedup_save(data):
     tmp = SHARED_DEDUP + ".tmp"
@@ -107,17 +111,28 @@ def _shared_dedup_save(data):
     os.replace(tmp, SHARED_DEDUP)
 
 def shared_is_bought(ca):
-    return ca.lower() in _shared_dedup_load()
+    data = _shared_dedup_load()
+    now = int(time.time())
+    for entry in data:
+        if entry.get('ca', '').lower() == ca.lower():
+            if now - entry.get('ts', 0) < 3600:
+                return True
+    return False
 
 def shared_mark_bought(ca, ticker, chain="56"):
-    d = _shared_dedup_load()
-    d[ca.lower()] = {"ticker": ticker, "chain": chain, "ts": int(time.time())}
-    _shared_dedup_save(d)
+    data = _shared_dedup_load()
+    now = int(time.time())
+    # Remove old entry for this CA
+    data = [e for e in data if e.get('ca', '').lower() != ca.lower()]
+    # Remove expired entries
+    data = [e for e in data if now - e.get('ts', 0) < 3600]
+    data.append({"ca": ca, "ticker": ticker, "chain": chain, "ts": now})
+    _shared_dedup_save(data)
 
 def shared_mark_sold(ca):
-    d = _shared_dedup_load()
-    d.pop(ca.lower(), None)
-    _shared_dedup_save(d)
+    data = _shared_dedup_load()
+    data = [e for e in data if e.get('ca', '').lower() != ca.lower()]
+    _shared_dedup_save(data)
 
 
 def notify_telegram(msg):
@@ -655,11 +670,6 @@ def check_and_close_position(ca):
     # ─── Stop Loss ───
     if sl_price > 0 and cur_p <= sl_price:
         print(f"  [!] {ticker} SL HIT ({pnl_pct*100:.1f}%)")
-        # Cancel any existing TP limit order before market sell
-        tp_strategy_id = pos.get("tp_strategy_id", "")
-        if tp_strategy_id:
-            print(f"  [CANCEL] Cancelling TP limit order {tp_strategy_id}")
-            baw_run(["limit-order", "cancel", "--strategyId", str(tp_strategy_id)], timeout=15)
         success, tx = sell_token(ca, ticker, 1.0, "SL_HIT")
         if success:
             cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
@@ -679,11 +689,6 @@ def check_and_close_position(ca):
     # ─── Take Profit ───
     if tp_price > 0 and cur_p >= tp_price:
         print(f"  [!] {ticker} TP HIT (+{pnl_pct*100:.1f}%)")
-        # Cancel any existing TP limit order before market sell
-        tp_strategy_id = pos.get("tp_strategy_id", "")
-        if tp_strategy_id:
-            print(f"  [CANCEL] Cancelling TP limit order {tp_strategy_id}")
-            baw_run(["limit-order", "cancel", "--strategyId", str(tp_strategy_id)], timeout=15)
         success, tx = sell_token(ca, ticker, 1.0, "TP_HIT")
         if success:
             cancel_limit_order(ca, ticker, pos.get("tp_strategy_id", ""), "TP")
@@ -744,34 +749,40 @@ def check_and_close_position(ca):
 
     # ─── soldRatio-based exit ───
     sold_ratio = float(pos.get('sold_ratio', 0))
-    if sold_ratio >= SOLD_RATIO_EXIT_THRESH and not pos.get('sold_ratio_triggered'):
-        print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE')
-        for sk in ['tp_strategy_id', 'sl_strategy_id']:
-            sid = pos.get(sk, '')
-            if sid:
-                cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
-        success, tx = sell_token(ca, ticker, 1.0, 'SOLD_RATIO_EXIT')
-        if success:
-            pos['sold_ratio_triggered'] = True
+    if sold_ratio > 0:
+        if sold_ratio >= SOLD_RATIO_EXIT_THRESH and not pos.get('sold_ratio_exit_done'):
+            print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE')
+            for sk in ['tp_strategy_id', 'sl_strategy_id']:
+                sid = pos.get(sk, '')
+                if sid:
+                    cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+            success, tx = sell_token(ca, ticker, 1.0, 'SOLD_RATIO_EXIT')
+            if success:
+                pos['sold_ratio_exit_done'] = True
             record_trade_close(ca, 'SOLD_RATIO_EXIT', pnl_pct)
             shared_mark_sold(ca)
             del state['positions'][ca]
             save_state(state)
             return True
-    elif sold_ratio >= SOLD_RATIO_REDUCE_THRESH and not pos.get('sold_ratio_triggered'):
-        print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> reduce 50%')
-        for sk in ['tp_strategy_id', 'sl_strategy_id']:
-            sid = pos.get(sk, '')
-            if sid:
-                cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
-                pos[sk] = ''
-        success, tx = sell_token(ca, ticker, 0.5, 'SOLD_RATIO_REDUCE')
-        if success:
-            pos['sold_ratio_triggered'] = True
-            pos['sl_price'] = max(float(pos.get('sl_price', 0)), ep)
-            pos['amount'] = float(pos.get('amount', 0)) * 0.5
-            pos['sold_pct'] = float(pos.get('sold_pct', 0)) + 0.5
-            save_state(state)
+        elif sold_ratio >= SOLD_RATIO_REDUCE_THRESH and not pos.get('sold_ratio_reduce_done'):
+            print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> reduce 50%')
+            for sk in ['tp_strategy_id', 'sl_strategy_id']:
+                sid = pos.get(sk, '')
+                if sid:
+                    cancel_limit_order(ca, ticker, sid, sk.replace('_strategy_id','').upper())
+            success, tx = sell_token(ca, ticker, 0.5, 'SOLD_RATIO_REDUCE')
+            if success:
+                pos['sold_ratio_reduce_done'] = True
+                pos['sl_price'] = max(float(pos.get('sl_price', 0)), float(pos.get('entry_price', 0)))
+                pos['amount'] = float(pos.get('amount', 0)) * 0.5
+                save_state(state)
+        elif sold_ratio < SOLD_RATIO_REDUCE_THRESH:
+            # Reset flags when soldRatio drops below threshold
+            if pos.get('sold_ratio_exit_done') or pos.get('sold_ratio_reduce_done'):
+                pos['sold_ratio_exit_done'] = False
+                pos['sold_ratio_reduce_done'] = False
+                save_state(state)
+
 
     # ─── Time-weighted stop loss (onchainos v3.2) ───
     entry_ts = int(pos.get('entry_ts', 0) or 0)
@@ -818,53 +829,7 @@ def check_and_close_position(ca):
                 pos['sold_pct'] = float(pos.get('sold_pct', 0)) + 0.5
                 save_state(state)
 
-    # ─── Dynamic Partial TP (v3 rule) ───
-    if pnl_pct >= 0.10 and not pos.get("partial_tp_10_done"):
-        print(f"  [*] {ticker} +{pnl_pct*100:.1f}% -> partial TP 50%")
-        # Cancel old TP limit order before partial sell (otherwise it over-sells)
-        tp_sid = pos.get("tp_strategy_id", "")
-        if tp_sid:
-            print(f"  [CANCEL] Cancelling old TP limit {tp_sid} before partial TP")
-            baw_run(["limit-order", "cancel", "--strategyId", str(tp_sid)], timeout=15)
-            pos["tp_strategy_id"] = ""
-            save_state(state)
-        success, tx = sell_token(ca, ticker, 0.5, "PARTIAL_TP10")
-        if success:
-            pos["partial_tp_10_done"] = True
-            pos["sl_price"] = max(float(pos.get("sl_price", 0)), ep * 1.0)
-            pos["amount"] = float(pos.get("amount", 0)) * 0.5
-            save_state(state)
-            # Place new TP limit order for remaining 50% at +12%
-            remaining = pos.get("amount", 0)
-            if remaining > 0:
-                tp_ok, tp_res = place_tp_limit_order(ca, ticker, remaining, pos.get("tp_price", ep * 1.12))
-                if tp_ok:
-                    pos["tp_strategy_id"] = str(tp_res)
-                    save_state(state)
-                    print(f"  [NEW TP LIMIT] strategyId={tp_res}")
-
-    if pnl_pct >= 0.15 and not pos.get("partial_tp_15_done"):
-        print(f"  [*] {ticker} +{pnl_pct*100:.1f}% -> partial TP 25% more")
-        tp_sid = pos.get("tp_strategy_id", "")
-        if tp_sid:
-            print(f"  [CANCEL] Cancelling old TP limit {tp_sid} before partial TP")
-            baw_run(["limit-order", "cancel", "--strategyId", str(tp_sid)], timeout=15)
-            pos["tp_strategy_id"] = ""
-            save_state(state)
-        success, tx = sell_token(ca, ticker, 0.5, "PARTIAL_TP15")
-        if success:
-            pos["partial_tp_15_done"] = True
-            pos["sl_price"] = max(float(pos.get("sl_price", 0)), ep * 1.03)
-            pos["amount"] = float(pos.get("amount", 0)) * 0.5
-            save_state(state)
-            remaining = pos.get("amount", 0)
-            if remaining > 0:
-                tp_ok, tp_res = place_tp_limit_order(ca, ticker, remaining, pos.get("tp_price", ep * 1.12))
-                if tp_ok:
-                    pos["tp_strategy_id"] = str(tp_res)
-                    save_state(state)
-                    print(f"  [NEW TP LIMIT] strategyId={tp_res}")
-
+    # (Old partial TP +10%/+15% removed — conflicts with Ladder TP v3.2)
     if pnl_pct >= 0.08 and not pos.get("breakeven_done"):
         pos["sl_price"] = max(float(pos.get("sl_price", 0)), ep)
         pos["breakeven_done"] = True
@@ -917,7 +882,7 @@ def record_trade_close(ca, reason, pnl_pct):
         if risk_check["bsc_consecutive_sl"] >= CONSECUTIVE_SL_FREEZE:
             freeze_until = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=FREEZE_DURATION_HOURS)).isoformat()
             risk_check["bsc_freeze_until"] = freeze_until
-            print(f"  [RISK] {risk_check['consecutive_sl']} consecutive SL -> FROZEN until {freeze_until}")
+            print(f"  [RISK] {risk_check['bsc_consecutive_sl']} consecutive SL -> FROZEN until {freeze_until}")
     elif "TP" in reason:
         risk_check["bsc_consecutive_sl"] = 0
     state["risk_check"] = risk_check
@@ -952,7 +917,7 @@ def main():
                 print(f"  [FROZEN] Trading frozen for {remaining:.0f}min")
                 return
             else:
-                risk_check["freeze_until"] = None
+                risk_check["bsc_freeze_until"] = None
                 risk_check["bsc_consecutive_sl"] = 0
                 state["risk_check"] = risk_check
         except Exception:
@@ -1172,12 +1137,10 @@ def main():
                     "sig_id": _sig_id,
                     "score": score,
                     "reasons": reasons,
-                    "partial_tp_10_done": False,
                     "sold_ratio": float(sig.get("soldRatioPercent", 0)),
-                    "sold_ratio_triggered": False,
-                    "partial_tp_15_done": False,
+                    "sold_ratio_exit_done": False,
+                    "sold_ratio_reduce_done": False,
                     "breakeven_done": False,
-                    "partial_tp_20_done": False,
                     "tp_limit_placed": tp_limit_placed,
                     "tp_strategy_id": tp_strategy_id,
                     "tp_limit_error": tp_limit_error,

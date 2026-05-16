@@ -24,7 +24,9 @@ from qclaw_trading_common import (  # noqa: E402
 )
 
 DATA_DIR   = os.path.expanduser('~/.qclaw/workspace/data')
-STATE_FILE = os.path.join(DATA_DIR, 'smart-money-state.json')
+STATE_FILE_BSC = os.path.join(DATA_DIR, 'smart-money-bsc-state.json')
+STATE_FILE_SOL = os.path.join(DATA_DIR, 'smart-money-sol-state.json')
+STATE_FILES = [STATE_FILE_BSC, STATE_FILE_SOL]  # monitor reads both separated state files
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
 RETRY_LOG  = os.path.join(DATA_DIR, 'retry-log.txt')
 TRADE_LOG  = os.path.join(DATA_DIR, 'trade-log.json')
@@ -32,10 +34,21 @@ ONCHAINOS  = r'C:\Users\dell\.local\bin\onchainos.exe'
 WALLET_ADDR = '77BP1JzBARGaQ8eJWj6B1RYvaB4zRxU7Nx7BDYdgLCAa'
 SOL_USDT    = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB'
 def load_state():
-    return locked_read_json(STATE_FILE, {'positions': {}, 'cooldowns': {}})
+    merged = {'positions': {}, 'cooldowns': {}}
+    for sf in STATE_FILES:
+        s = locked_read_json(sf, {'positions': {}, 'cooldowns': {}})
+        merged['positions'].update(s.get('positions', {}))
+        merged['cooldowns'].update(s.get('cooldowns', {}))
+    return merged
 
 def save_state(s):
-    locked_write_json(STATE_FILE, s)
+    # Split positions by chain and write to correct state file
+    bsc_pos = {ca: p for ca, p in s.get('positions', {}).items() if p.get('chain_id') == '56' or p.get('chain') == 'bsc'}
+    sol_pos = {ca: p for ca, p in s.get('positions', {}).items() if p.get('chain_id') != '56' and p.get('chain') != 'bsc'}
+    bsc_state = {'positions': bsc_pos, 'cooldowns': {}}
+    sol_state = {'positions': sol_pos, 'cooldowns': {}}
+    locked_write_json(STATE_FILE_BSC, bsc_state)
+    locked_write_json(STATE_FILE_SOL, sol_state)
 
 def notify(msg):
     TG_TOKEN, TG_CHAT_ID = telegram_env()

@@ -19,6 +19,7 @@ from qclaw_trading_common import (
     canonical_chain_for_onchainos,
     locked_write_json,
 )
+from okx_dex_ws import OkxDexWs  # optional WS data source
 
 DATA_DIR = os.path.join(os.path.expanduser('~'), '.qclaw', 'workspace', 'data')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')

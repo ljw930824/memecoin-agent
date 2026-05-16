@@ -939,6 +939,8 @@ def reconcile_wallet(state):
 
 
     """Scan wallet, align state with reality"""
+    if DRY_RUN:
+        return state  # Skip real wallet queries in simulation
 
 
     positions = state.get('positions', {})

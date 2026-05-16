@@ -1,4 +1,4 @@
-﻿"""
+"""
 
 realtime_sm_monitor.py v3.3 ??(Bug ?
 
@@ -37,8 +37,11 @@ except ImportError:
 sys.stdout.reconfigure(encoding='utf-8')
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WS_CLIENT = None  # WebSocket primary data source (direct OKX DEX WS v6)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
+from okx_dex_ws import OkxDexWs
+
 try:
     from qclaw_trading_common import okx_env_for_subprocess  # noqa: E402
 except ImportError:
@@ -1126,8 +1129,17 @@ def is_good_wallet(wallets, addr):
 
 def fetch_tracker():
 
-    """Fetch recent smart money trades (solana + bsc)"""
+    """Fetch recent smart money trades -- WS primary, REST fallback."""
 
+    global _WS_CLIENT
+
+    # Try direct OKX DEX WS v6 first (primary data source)
+    if _WS_CLIENT and _WS_CLIENT.is_connected:
+        ws_trades = _WS_CLIENT.get_events()
+        if ws_trades:
+            return ws_trades
+
+    # REST fallback (onchainos CLI) when WS is down or has no events
     all_trades = []
 
     for ch in ['solana', 'bsc']:
@@ -2053,7 +2065,7 @@ def check_positions(positions, state=None):
 
     to_sell_partial = []
 
-    to_remove = []  # FIX: ?
+    # to_remove removed — dead positions go through to_sell_all for proper selling
 
     now_ts = int(time.time())
 
@@ -2093,9 +2105,9 @@ def check_positions(positions, state=None):
 
             if hold_hours > POSITION_STALE_HOURS:
 
-                log(f'DEAD: {sym} {hold_hours:.0f}h  -> ')
-
-                to_remove.append(ca)
+                log(f'DEAD: {sym} {hold_hours:.0f}h  -> selling')
+                to_sell_all.append((ca, 'dead_position'))
+                continue
 
             else:
 
@@ -2127,10 +2139,8 @@ def check_positions(positions, state=None):
 
         if position_value < DEAD_POSITION_USD and hold_hours > 1:
 
-            log(f'DEAD: {sym} ?${position_value:.2f} < ${DEAD_POSITION_USD} -> ')
-
-            to_remove.append(ca)
-
+            log(f'DEAD: {sym} ${position_value:.2f} < $DEAD_POSITION_USD -> selling')
+            to_sell_all.append((ca, 'dead_position'))
             continue
 
 
@@ -2261,23 +2271,7 @@ def check_positions(positions, state=None):
 
 
 
-    # FIX: (,???gas?
-
-    for ca in to_remove:
-
-        pos = positions.pop(ca, {})
-
-        sym = pos.get('symbol', '?')
-
-        exit_price = float(pos.get('current_price', pos.get('entry_price', 0)))
-
-        ep = float(pos.get('entry_price', 0) or 0)
-
-        exit_pnl = (exit_price - ep) / ep if ep > 0 else 0
-
-        _save_trade_history(state, pos, exit_price, exit_pnl, 'dead_position')
-
-        log(f'? {sym} (?')
+    # (Dead position removal loop removed — dead positions now go through to_sell_all)
 
 
 
@@ -2563,6 +2557,14 @@ def main():
 
     wallets = load_wallets()
 
+    # Start WebSocket as primary data source (direct OKX DEX WS v6)
+    global _WS_CLIENT
+    try:
+        _WS_CLIENT = OkxDexWs()
+        _WS_CLIENT.start()
+        log('WS data source started')
+    except Exception as e:
+        log(f'WS start failed: {e}, using REST fallback')
 
 
     if ONCE:
@@ -2611,6 +2613,13 @@ def main():
     except KeyboardInterrupt:
 
         log('Stopped by user')
+
+        if _WS_CLIENT:
+            try:
+                _WS_CLIENT.stop()
+                log('WS data source stopped')
+            except:
+                pass
 
         save_state(state)
 

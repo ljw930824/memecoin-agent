@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import json, math, os, sys, time, subprocess
 from datetime import datetime, timezone, timedelta
 
@@ -19,7 +19,7 @@ from qclaw_trading_common import (  # noqa: E402
 )
 
 DATA_DIR   = os.path.expanduser('~/.qclaw/workspace/data')
-STATE_FILE = os.path.join(DATA_DIR, 'smart-money-state.json')
+STATE_FILE = os.path.join(DATA_DIR, 'smart-money-sol-state.json')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
 RETRY_LOG  = os.path.join(DATA_DIR, 'retry-log.txt')
 TRADE_LOG  = os.path.join(DATA_DIR, 'trade-log.json')
@@ -335,6 +335,22 @@ def preflight_safety_check(ca, ticker, invest_usdt):
             return False, 'exception', 0, 0.0
 
 def buy_token(ca, ticker, amount_usdt, entry_price):
+    # Cross-chain dedup: skip if recently bought on any chain
+    import time as _time
+    shared_dedup_file = os.path.join(DATA_DIR, 'shared_bought.json')
+    if os.path.exists(shared_dedup_file):
+        try:
+            with open(shared_dedup_file, 'r', encoding='utf-8') as f:
+                shared = json.load(f)
+            now_ts = _time.time()
+            for entry in shared:
+                if entry.get('ca', '').lower() == ca.lower():
+                    age = now_ts - entry.get('ts', 0)
+                    if age < 3600:
+                        print('  SKIP ' + ticker + ' — already bought cross-chain ' + str(int(age)) + 's ago')
+                        return False, 'duplicate_cross_chain', None
+        except Exception:
+            pass
     print('')
     print('  >> BUY ' + ticker + ' | $' + str(round(amount_usdt, 2)) + ' on Solana')
     safe, reason, score, impact = preflight_safety_check(ca, ticker, amount_usdt)
@@ -453,24 +469,11 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
             save_state(state)
             return True
         return False
-    if pnl_pct >= 0.10 and not pos.get('partial_tp_10'):
-        bal, _, _ = get_token_balance(ca)
-        if bal > 0:
-            print('  [*] ' + ticker + ' +' + str(round(pnl_pct*100,1)) + '% -> partial TP 50%')
-            success, _ = sell_token(ca, ticker, 0.5, 'PARTIAL_TP10')
-            if success:
-                pos['partial_tp_10'] = True
-                pos['sl_price'] = max(float(pos['sl_price']), ep)
-                pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
-    if pnl_pct >= 0.15 and not pos.get('partial_tp_15'):
-        success, _ = sell_token(ca, ticker, 0.5, 'PARTIAL_TP15')
-        if success:
-            pos['partial_tp_15'] = True
-            pos['sl_price'] = max(float(pos['sl_price']), ep * 1.03)
-            pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
+    # (Old partial TP at +10%/+15% removed — conflicts with Ladder TP v3.2)
     if pnl_pct >= 0.05 and not pos.get('breakeven_done'):
         pos['sl_price'] = max(float(pos['sl_price']), ep)
         pos['breakeven_done'] = True
+        save_state(state)
     # Trailing stop: after breakeven, track SL 2% below peak
     if pos.get('breakeven_done'):
         peak = float(pos.get('peak_price', ep))
@@ -484,13 +487,19 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
             entry_dt = datetime.fromisoformat(entry_time_str)
             holding_hours = (now - entry_dt).total_seconds() / 3600
             if holding_hours >= 48:
-                print('  [TIMEOUT] ' + ticker + ' held ' + str(int(holding_hours)) + 'h -> force close')
-                success, _ = sell_token(ca, ticker, 1.0, 'TIMEOUT_48H')
-                if success:
-                    record_close(ca, 'TIMEOUT_48H', pnl_pct)
-                    del state['positions'][ca]
+                fc_attempts = pos.get('fc_attempts', 0)
+                if fc_attempts >= 5:
+                    print('  [TIMEOUT] ' + ticker + ' force close failed ' + str(fc_attempts) + 'x — zombie, needs manual review')
+                else:
+                    pos['fc_attempts'] = fc_attempts + 1
+                    print('  [TIMEOUT] ' + ticker + ' held ' + str(int(holding_hours)) + 'h -> force close (attempt ' + str(pos['fc_attempts']) + '/5)')
+                    success, _ = sell_token(ca, ticker, 1.0, 'TIMEOUT_48H')
+                    if success:
+                        record_close(ca, 'TIMEOUT_48H', pnl_pct)
+                        del state['positions'][ca]
+                        save_state(state)
+                        return True
                     save_state(state)
-                    return True
             elif holding_hours >= 24 and abs(pnl_pct) < 0.03 and not pos.get('timeout_24h_done'):
                 print('  [TIMEOUT] ' + ticker + ' held ' + str(int(holding_hours)) + 'h no movement -> reduce 50%')
                 success, _ = sell_token(ca, ticker, 0.5, 'TIMEOUT_24H')
@@ -536,8 +545,8 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
 
     # soldRatio-based exit: smart money reducing -> reduce position
     sold_ratio = pos.get('sold_ratio', 0)
-    if sold_ratio > 0 and not pos.get('sold_ratio_triggered'):
-        if sold_ratio >= SOLD_RATIO_EXIT_THRESH:
+    if sold_ratio > 0:
+        if sold_ratio >= SOLD_RATIO_EXIT_THRESH and not pos.get('sold_ratio_exit_done'):
             print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> FULL CLOSE')
             success, _ = sell_token(ca, ticker, 1.0, 'SOLD_RATIO_EXIT')
             if success:
@@ -546,15 +555,19 @@ def check_position(ca, force_sell=False, force_sell_pct=1.0, force_reason=''):
                 state['cooldowns'][ca] = (now + timedelta(hours=COOLDOWN_SL)).isoformat()
                 save_state(state)
                 return True
-        elif sold_ratio >= SOLD_RATIO_REDUCE_THRESH:
+        elif sold_ratio >= SOLD_RATIO_REDUCE_THRESH and not pos.get('sold_ratio_reduce_done'):
             print(f'  [SOLD_RATIO] {ticker} soldRatio={sold_ratio:.0f}% -> reduce 50%')
             success, _ = sell_token(ca, ticker, 0.5, 'SOLD_RATIO_REDUCE')
             if success:
-                pos['sold_ratio_triggered'] = True
+                pos['sold_ratio_reduce_done'] = True
                 pos['sl_price'] = max(float(pos.get('sl_price', 0)), float(pos.get('entry_price', 0)))
                 pos['invest_amount'] = float(pos.get('invest_amount', 0)) * 0.5
                 save_state(state)
-                save_state(state)
+        elif sold_ratio < SOLD_RATIO_REDUCE_THRESH:
+            # Reset flags when soldRatio drops below threshold (allows re-trigger)
+            pos['sold_ratio_exit_done'] = False
+            pos['sold_ratio_reduce_done'] = False
+            save_state(state)
     return False
 
 def record_close(ca, reason, pnl_pct):
@@ -585,7 +598,7 @@ def record_close(ca, reason, pnl_pct):
         if risk_check["sol_consecutive_sl"] >= CONSECUTIVE_SL_FREEZE:
             freeze_until = (datetime.now(timezone(timedelta(hours=8))) + timedelta(hours=FREEZE_DURATION_HOURS)).isoformat()
             risk_check["sol_freeze_until"] = freeze_until
-            print(f"  [RISK] {risk_check['consecutive_sl']} consecutive SL -> FROZEN until {freeze_until}")
+            print(f"  [RISK] {risk_check['sol_consecutive_sl']} consecutive SL -> FROZEN until {freeze_until}")
     elif "TP" in reason:
         risk_check["sol_consecutive_sl"] = 0
     state["risk_check"] = risk_check
@@ -679,7 +692,7 @@ def main():
                 print(f"  [FROZEN] Trading frozen for {remaining:.0f}min")
                 return
             else:
-                risk_check["freeze_until"] = None
+                risk_check["sol_freeze_until"] = None
                 risk_check["sol_consecutive_sl"] = 0
                 state["risk_check"] = risk_check
         except Exception:
@@ -771,6 +784,20 @@ def main():
                     sl_pct = float(meta.get('sl_pct', sl_pct))
                     tp_pct = float(meta.get('tp_pct', tp_pct))
                     invest_used = float(meta.get('invest', invest))
+                # Record in cross-chain dedup
+                shared_dedup_file2 = os.path.join(DATA_DIR, 'shared_bought.json')
+                shared2 = []
+                if os.path.exists(shared_dedup_file2):
+                    try:
+                        with open(shared_dedup_file2, 'r', encoding='utf-8') as f:
+                            shared2 = json.load(f)
+                    except Exception:
+                        pass
+                now_ts2 = time.time()
+                shared2 = [e for e in shared2 if now_ts2 - e.get('ts', 0) < 3600]
+                shared2.append({'ca': ca, 'ticker': ticker, 'chain': 'Solana', 'ts': now_ts2})
+                with open(shared_dedup_file2, 'w', encoding='utf-8') as f:
+                    json.dump(shared2, f)
                 state['positions'][ca] = {
                     'chain': 'Solana', 'chain_id': SOL_CHAIN,
                     'ticker': ticker, 'ca': ca,
@@ -784,11 +811,10 @@ def main():
                     'sig_id': sig.get('sigId', ''),
                     'score': score,
                     'reasons': sig.get('reasons', []),
-                    'partial_tp_10': False,
-                    'partial_tp_15': False,
                     'breakeven_done': False,
                     'sold_ratio': float(sig.get('soldRatioPercent', 0)),
-                    'sold_ratio_triggered': False,
+                    'sold_ratio_exit_done': False,
+                    'sold_ratio_reduce_done': False,
                 }
                 usdt_bal -= invest_used
                 sol_open += 1
