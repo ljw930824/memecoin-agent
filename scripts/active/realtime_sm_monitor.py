@@ -2177,7 +2177,8 @@ def check_positions(positions, state=None):
 
                     break
 
-                dynamic_sl = tier_sl
+                if tier_sl is not None:
+                    dynamic_sl = tier_sl
 
                 if tier_tp is None:
 
@@ -2239,7 +2240,7 @@ def check_positions(positions, state=None):
 
 
 
-        effective_sl = dynamic_sl + trend_adj  # ??
+        effective_sl = (dynamic_sl if dynamic_sl is not None else SL_PCT) + trend_adj  # double guard
 
         if pnl <= effective_sl:
 

@@ -1,4 +1,4 @@
-﻿"""
+"""
 
 
 realtime_sm_monitor.py v3.3 ??(Bug ?
@@ -53,11 +53,21 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+# Also add scripts/active/ for WS, safety_check, etc.
+_ACTIVE_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), "active")
+if _ACTIVE_DIR not in sys.path:
+    sys.path.insert(0, _ACTIVE_DIR)
+
+from okx_dex_ws import OkxDexWs
+
 try:
     from safety_check import check_token, format_safety_report
     _HAS_SAFETY = True
 except ImportError:
     _HAS_SAFETY = False
+
+_WS_CLIENT = None  # WebSocket primary data source (direct OKX DEX WS v6)
+
 
 
 
@@ -1432,9 +1442,17 @@ def is_good_wallet(wallets, addr):
 def fetch_tracker():
 
 
-    """Fetch recent smart money trades (solana + bsc)"""
+    """Fetch recent smart money trades -- WS primary, REST fallback."""
 
+    global _WS_CLIENT
 
+    # Try direct OKX DEX WS v6 first (primary data source)
+    if _WS_CLIENT and _WS_CLIENT.is_connected:
+        ws_trades = _WS_CLIENT.get_events()
+        if ws_trades:
+            return ws_trades
+
+    # REST fallback (onchainos CLI) when WS is down or has no events
     all_trades = []
 
 
@@ -2784,7 +2802,8 @@ def check_positions(positions, state=None):
                     break
 
 
-                dynamic_sl = tier_sl
+                if tier_sl is not None:
+                    dynamic_sl = tier_sl
 
 
                 if tier_tp is None:
@@ -2877,7 +2896,7 @@ def check_positions(positions, state=None):
 
 
 
-        effective_sl = dynamic_sl + trend_adj  # ??
+        effective_sl = (dynamic_sl if dynamic_sl is not None else SL_PCT) + trend_adj  # double guard
 
         if pnl <= effective_sl:
 
@@ -3345,8 +3364,14 @@ def main():
 
     wallets = load_wallets()
 
-
-
+    # Start WebSocket as primary data source (direct OKX DEX WS v6)
+    global _WS_CLIENT
+    try:
+        _WS_CLIENT = OkxDexWs()
+        _WS_CLIENT.start()
+        log('WS data source started')
+    except Exception as e:
+        log(f'WS start failed: {e}, using REST fallback')
 
 
     if ONCE:
@@ -3400,9 +3425,14 @@ def main():
 
     except KeyboardInterrupt:
 
-
         log('Stopped by user')
 
+        if _WS_CLIENT:
+            try:
+                _WS_CLIENT.stop()
+                log('WS data source stopped')
+            except:
+                pass
 
         save_state(state)
 
