@@ -831,7 +831,7 @@ def reconcile_wallet(state):
 
                                 continue
 
-                            sym = ta.get('tokenSymbol', '?')
+                            sym = ta.get('symbol') or ta.get('tokenSymbol', '?')
 
                             bal = float(ta.get('balance', 0) or 0)
 
@@ -928,9 +928,10 @@ def reconcile_wallet(state):
 
         value_usd = info['balance'] * info['price']
 
-        if ca not in positions and value_usd >= DEAD_POSITION_USD:
+        if ca not in positions and value_usd >= DEAD_POSITION_USD and info['symbol'] and info['symbol'] != '?':
 
-            pos_data = {'symbol': info['symbol'], 'chain': info['chain'], 'entry_ts': now_ts, 'entry_mcap': 0, 'entry_price': info['price'], 'entry_usd_amount': BUY_SIZE_USDT, 'last_update_ts': now_ts, 'sm_buys': 0, 'sm_sells': 0, 'buy_tx': 'recovered', 'sold_pct': 0.0, 'ladder_step': 0, 'current_price': info['price'], 'pnl_pct': 0.0, 'recovered': True, 'entry_price_est': True}
+            sl_price = info['price'] * (1 + SL_PCT)
+            pos_data = {'symbol': info['symbol'], 'chain': info['chain'], 'entry_ts': now_ts, 'entry_mcap': 0, 'entry_price': info['price'], 'entry_usd_amount': BUY_SIZE_USDT, 'last_update_ts': now_ts, 'sm_buys': 0, 'sm_sells': 0, 'buy_tx': 'recovered', 'sold_pct': 0.0, 'ladder_step': 0, 'current_price': info['price'], 'pnl_pct': 0.0, 'recovered': True, 'entry_price_est': True, 'sl': sl_price, 'sl_pct': SL_PCT}
 
             if info['chain'] == 'bsc':
 
