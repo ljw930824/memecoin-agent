@@ -351,6 +351,7 @@ def check_token(chain, token_ca, trade_amount_usd=5.0):
     chain: 'Solana' 或 'BSC' (or '56')
     返回: (score, passed, details, errors)
     """
+    import sys; sys.stderr.write(f'DEBUG check_token: chain={repr(chain)} len={len(str(chain)) if chain else 0} ca={token_ca[:30] if token_ca else None}\n'); sys.stderr.flush()
     chain_lower = chain.lower() if isinstance(chain, str) else str(chain)
     if chain_lower in ('solana', '501'):
         return check_solana(token_ca, trade_amount_usd)
