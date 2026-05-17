@@ -305,8 +305,13 @@ def get_effective_risk(state):
     today_start = int(time.mktime(time.strptime(time.strftime('%Y-%m-%d'), '%Y-%m-%d')))
     realized_daily = 0.0
     for t in state.get('trade_history', []):
-        if t.get('exit_ts', 0) >= today_start:
-            realized_daily += t.get('exit_usd', t.get('exit_usd_amount', 0)) - t.get('entry_usd_amount', BUY_SIZE_USDT)
+        exit_ts = t.get('exit_ts') or 0
+        exit_usd = t.get('exit_usd') or t.get('exit_usd_amount') or 0
+        entry_usd = t.get('entry_usd_amount') or 0
+        if not exit_ts or not exit_usd or not entry_usd:
+            continue  # skip corrupted entries
+        if exit_ts >= today_start:
+            realized_daily += exit_usd - entry_usd
     unrealized_daily = 0.0
     for ca, p in state.get('positions', {}).items():
         if int(p.get('entry_ts', 0)) >= today_start:
@@ -393,9 +398,11 @@ def check_risk_limits(state):
     realized_daily = 0.0
     realized_monthly = 0.0
     for t in state.get('trade_history', []):
-        exit_ts = t.get('exit_ts', 0)
-        exit_usd = t.get('exit_usd', t.get('exit_usd_amount', 0))
-        entry_usd = t.get('entry_usd_amount', BUY_SIZE_USDT)
+        exit_ts = t.get('exit_ts') or 0
+        exit_usd = t.get('exit_usd') or t.get('exit_usd_amount') or 0
+        entry_usd = t.get('entry_usd_amount') or 0
+        if not exit_ts or not exit_usd or not entry_usd:
+            continue  # skip corrupted entries
         pnl_usd = exit_usd - entry_usd
         if exit_ts >= month_start:
             realized_monthly += pnl_usd
@@ -715,7 +722,7 @@ def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0
         else:
             log(f'CONSEC SL: {cs}/{CONSEC_SL_LIMIT}')
     elif reason not in ('dead_position',):
-        if state.get('consec_sl', 0) > 0:
+        if int(state.get('consec_sl') or 0) > 0:
             log('CONSEC SL reset')
         state['consec_sl'] = 0
         state['consec_sl_freeze_until'] = 0
