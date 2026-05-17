@@ -351,9 +351,10 @@ def check_token(chain, token_ca, trade_amount_usd=5.0):
     chain: 'Solana' 或 'BSC' (or '56')
     返回: (score, passed, details, errors)
     """
-    if chain in ('Solana', '501'):
+    chain_lower = chain.lower() if isinstance(chain, str) else str(chain)
+    if chain_lower in ('solana', '501'):
         return check_solana(token_ca, trade_amount_usd)
-    elif chain in ('BSC', '56'):
+    elif chain_lower in ('bsc', '56'):
         return check_bsc(token_ca, trade_amount_usd)
     else:
         return 0, False, {}, [f'unknown_chain: {chain}']
