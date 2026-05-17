@@ -1,4 +1,4 @@
-"""
+﻿"""
 
 realtime_sm_monitor.py v3.3 ??(Bug ?
 
@@ -1959,7 +1959,6 @@ def process_new_trades(trades, state, wallets):
 
             # Pre-buy safety check (honeypot, tax, liquidity)
             if _HAS_SAFETY and not DRY_RUN:
-                j=__import__('safety_check'); from datetime import datetime; sys.stderr.write(f'{datetime.now():%H:%M:%S} DBG safety_check from: {j.__file__} chain={repr(chain)}\n'); sys.stderr.flush()
                 s_score, s_passed, s_details, s_errors = check_token(chain, ca, dynamic_buy)
                 if not s_passed:
                     reason = ', '.join(s_errors) if s_errors else 'low_score'

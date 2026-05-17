@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Patch 4 features into sim + monitor.
+Direct line-based approach to avoid indentation issues.
+"""
+import os, py_compile, shutil
+
+SIM = os.path.expanduser("~/.qclaw/workspace/scripts/simulation/sm_monitor_sim.py")
+MON = os.path.expanduser("~/.qclaw/workspace/scripts/active/realtime_sm_monitor.py")
+
+def patch_one(filepath, label):
+    with open(filepath, 'r', encoding='utf-8-sig') as f:
+        lines = f.readlines()
+
+    # Backup
+    bak = filepath + '.pre_feat2'
+    if not os.path.exists(bak):
+        shutil.copy2(filepath, bak)
+
+    changes = 0
+
+    # Find key lines
+    wallet_file_line = None
+    sm_sell_line = None
+    reload_pos_line = None
+    save_trade_history_log_line = None
+    execute_sell_line = None
+    time_tiers_line = None
+    monthly_pause_line = None
+    recently_traded_line = None
+    record_dedup_line = None
+    get_price_line = None
+
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("WALLET_FILE = ") and wallet_file_line is None:
+            wallet_file_line = i
+        if s.startswith("SM_SELL_FOLLOW = ") and sm_sell_line is None:
+            sm_sell_line = i
+        if s.startswith("def reload_positions_if_external_change") and reload_pos_line is None:
+            reload_pos_line = i
+        if "trade_history:" in s and "closed pnl" in s and "reason" in s and save_trade_history_log_line is None:
+            save_trade_history_log_line = i
+        if s.startswith("def execute_sell(") and execute_sell_line is None:
+            execute_sell_line = i
+        if s.startswith("TIME_TIERS = [") and time_tiers_line is None:
+            time_tiers_line = i
+        if "monthly pause until" in s and monthly_pause_line is None:
+            monthly_pause_line = i
+        if "recently traded (cooldown)" in s and recently_traded_line is None:
+            recently_traded_line = i
+        if "Record in trade_history for dedup" in s and record_dedup_line is None:
+            record_dedup_line = i
+        if s.startswith("entry_price = get_token_price_usd") and get_price_line is None:
+            get_price_line = i
+
+    # Get indent level of function body
+    func_indent = "        "  # 8 spaces (standard)
+
+    # ---- FEATURE 1: Shared dedup ----
+    if 'SHARED_DEDUP_FILE' not in ''.join(lines):
+        # Add constant after WALLET_FILE
+        insert_lines = [
+            "\n",
+            "SHARED_DEDUP_FILE = os.path.join(DATA, 'shared_bought.json')\n",
+            "SHARED_DEDUP_TTL = 3600  # 1 hour dedup window\n",
+        ]
+        for j, il in enumerate(insert_lines):
+            lines.insert(wallet_file_line + 1 + j, il)
+        changes += 1
+        # Recalculate line positions after insert
+        offset = len(insert_lines)
+        if reload_pos_line is not None: reload_pos_line += offset
+        if sm_sell_line is not None: sm_sell_line += offset
+        if save_trade_history_log_line is not None: save_trade_history_log_line += offset
+        if execute_sell_line is not None: execute_sell_line += offset
+        if time_tiers_line is not None: time_tiers_line += offset
+        if monthly_pause_line is not None: monthly_pause_line += offset
+        if recently_traded_line is not None: recently_traded_line += offset
+        if record_dedup_line is not None: record_dedup_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +SHARED_DEDUP constant")
+
+    # Add dedup functions before reload_positions
+    if '_load_shared_dedup' not in ''.join(lines):
+        funcs = [
+            "\n",
+            "def _load_shared_dedup():\n",
+            '    """Load shared cross-chain dedup file."""\n',
+            "    try:\n",
+            "        if os.path.exists(SHARED_DEDUP_FILE):\n",
+            "            with open(SHARED_DEDUP_FILE, 'r', encoding='utf-8') as f:\n",
+            "                return json.load(f)\n",
+            "    except:\n",
+            "        pass\n",
+            "    return {}\n",
+            "\n",
+            "\n",
+            "def _save_shared_dedup(data):\n",
+            '    """Save shared cross-chain dedup file."""\n',
+            "    try:\n",
+            "        with open(SHARED_DEDUP_FILE, 'w', encoding='utf-8') as f:\n",
+            "            json.dump(data, f)\n",
+            "    except:\n",
+            "        pass\n",
+            "\n",
+            "\n",
+            "def _check_shared_dedup(ca):\n",
+            '    """Check if token was recently bought on any chain."""\n',
+            "    now = int(time.time())\n",
+            "    dedup = _load_shared_dedup()\n",
+            "    entry = dedup.get(ca, {})\n",
+            "    if entry and (now - entry.get('ts', 0)) < SHARED_DEDUP_TTL:\n",
+            "        return True\n",
+            "    return False\n",
+            "\n",
+            "\n",
+            "def _record_shared_dedup(ca, chain, sym):\n",
+            '    """Record token buy in shared dedup file."""\n',
+            "    now = int(time.time())\n",
+            "    dedup = _load_shared_dedup()\n",
+            "    dedup[ca] = {'ts': now, 'chain': chain, 'sym': sym}\n",
+            "    cutoff = now - SHARED_DEDUP_TTL * 2\n",
+            "    dedup = {k: v for k, v in dedup.items() if v.get('ts', 0) > cutoff}\n",
+            "    _save_shared_dedup(dedup)\n",
+            "\n",
+            "\n",
+        ]
+        for j, fl in enumerate(funcs):
+            lines.insert(reload_pos_line + j, fl)
+        changes += 1
+        offset = len(funcs)
+        if sm_sell_line is not None: sm_sell_line += offset
+        if save_trade_history_log_line is not None: save_trade_history_log_line += offset
+        if execute_sell_line is not None: execute_sell_line += offset
+        if time_tiers_line is not None: time_tiers_line += offset
+        if monthly_pause_line is not None: monthly_pause_line += offset
+        if recently_traded_line is not None: recently_traded_line += offset
+        if record_dedup_line is not None: record_dedup_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +SHARED_DEDUP functions")
+
+    # Add cross-chain dedup check after recently traded check
+    if '_check_shared_dedup' not in ''.join(lines):
+        check_lines = [
+            "            # Cross-chain dedup\n",
+            "            if _check_shared_dedup(ca):\n",
+            "                log(f'SKIP {sym}: cross-chain dedup (recently bought on other chain)')\n",
+            "                continue\n",
+            "\n",
+        ]
+        # Insert after recently_traded continue line
+        insert_at = recently_traded_line + 3  # after "continue" + blank line
+        for j, cl in enumerate(check_lines):
+            lines.insert(insert_at + j, cl)
+        changes += 1
+        offset = len(check_lines)
+        if record_dedup_line is not None: record_dedup_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +SHARED_DEDUP check")
+
+    # Record shared dedup after buy
+    if '_record_shared_dedup' not in ''.join(lines):
+        record_lines = [
+            "                # Record in shared cross-chain dedup\n",
+            "                _record_shared_dedup(ca, chain, sym)\n",
+            "\n",
+        ]
+        insert_at = record_dedup_line  # before "Record in trade_history for dedup"
+        for j, rl in enumerate(record_lines):
+            lines.insert(insert_at + j, rl)
+        changes += 1
+        offset = len(record_lines)
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +SHARED_DEDUP record")
+
+    # ---- FEATURE 2: Consecutive SL ----
+    if 'CONSEC_SL_LIMIT' not in ''.join(lines):
+        insert_lines = [
+            "CONSEC_SL_LIMIT = 3       # consecutive stop losses -> freeze\n",
+            "CONSEC_SL_FREEZE_SEC = 7200  # freeze for 2 hours\n",
+        ]
+        for j, il in enumerate(insert_lines):
+            lines.insert(sm_sell_line + 1 + j, il)
+        changes += 1
+        offset = len(insert_lines)
+        if save_trade_history_log_line is not None: save_trade_history_log_line += offset
+        if execute_sell_line is not None: execute_sell_line += offset
+        if time_tiers_line is not None: time_tiers_line += offset
+        if monthly_pause_line is not None: monthly_pause_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +CONSEC_SL constant")
+
+    # Add consec SL check in risk limits (after monthly pause check)
+    if 'consec_sl_freeze_until' not in ''.join(lines):
+        check_lines = [
+            "    # Consecutive SL freeze check\n",
+            "    consec_sl = state.get('consec_sl', 0)\n",
+            "    freeze_until = state.get('consec_sl_freeze_until', 0)\n",
+            "    if freeze_until and now < freeze_until:\n",
+            "        from datetime import datetime\n",
+            "        fu = datetime.fromtimestamp(freeze_until).strftime('%m-%d %H:%M')\n",
+            "        return False, f'consec SL freeze until {fu}'\n",
+            "\n",
+        ]
+        insert_at = monthly_pause_line + 1  # after the return False line for monthly pause
+        for j, cl in enumerate(check_lines):
+            lines.insert(insert_at + j, cl)
+        changes += 1
+        offset = len(check_lines)
+        if save_trade_history_log_line is not None: save_trade_history_log_line += offset
+        if execute_sell_line is not None: execute_sell_line += offset
+        if time_tiers_line is not None: time_tiers_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +CONSEC_SL check in risk limits")
+
+    # Add consec SL increment after trade_history log line
+    if "state['consec_sl']" not in ''.join(lines):
+        incr_lines = [
+            "        # Track consecutive stop losses\n",
+            "        if reason == 'stop_loss':\n",
+            "            state['consec_sl'] = state.get('consec_sl', 0) + 1\n",
+            "            cs = state['consec_sl']\n",
+            "            if cs >= CONSEC_SL_LIMIT:\n",
+            "                state['consec_sl_freeze_until'] = int(time.time()) + CONSEC_SL_FREEZE_SEC\n",
+            "                log(f'CONSEC SL: {cs} losses -> freeze 2h')\n",
+            "            else:\n",
+            "                log(f'CONSEC SL: {cs}/{CONSEC_SL_LIMIT}')\n",
+            "        elif reason not in ('dead_position',):\n",
+            "            # Reset on any non-SL close\n",
+            "            if state.get('consec_sl', 0) > 0:\n",
+            "                log(f'CONSEC SL reset (was {state[\"consec_sl\"]})')\n",
+            "            state['consec_sl'] = 0\n",
+            "            state['consec_sl_freeze_until'] = 0\n",
+        ]
+        insert_at = save_trade_history_log_line + 1
+        for j, il in enumerate(incr_lines):
+            lines.insert(insert_at + j, il)
+        changes += 1
+        offset = len(incr_lines)
+        if execute_sell_line is not None: execute_sell_line += offset
+        if time_tiers_line is not None: time_tiers_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +CONSEC_SL increment")
+
+    # ---- FEATURE 3: soldRatio ----
+    if '_check_sold_ratio' not in ''.join(lines):
+        func_lines = [
+            "\n",
+            "\n",
+            "def _check_sold_ratio(chain, ca):\n",
+            '    """Check soldRatio from onchainos API. Returns ratio (0-1) or None."""\n',
+            "    try:\n",
+            "        r = subprocess.run(\n",
+            "            ['onchainos', 'token', 'price-info', '--address', ca, '--chain', chain],\n",
+            "            capture_output=True, timeout=8, encoding='utf-8', errors='replace'\n",
+            "        )\n",
+            "        if r.returncode == 0 and r.stdout.strip():\n",
+            "            data = json.loads(r.stdout.strip())\n",
+            "            sr = data.get('soldRatio')\n",
+            "            if sr is not None:\n",
+            "                return float(sr)\n",
+            "    except:\n",
+            "        pass\n",
+            "    return None\n",
+        ]
+        for j, fl in enumerate(func_lines):
+            lines.insert(execute_sell_line + j, fl)
+        changes += 1
+        offset = len(func_lines)
+        if time_tiers_line is not None: time_tiers_line += offset
+        if get_price_line is not None: get_price_line += offset
+        print(f"  [{label}] +SOLDRATIO function")
+
+    # Add soldRatio check before get_price
+    if '_check_sold_ratio' not in ''.join(lines) or 'soldRatio=' not in ''.join(lines):
+        # Find get_price_line again (might have shifted)
+        for i, line in enumerate(lines):
+            if line.strip().startswith("entry_price = get_token_price_usd") and i > 2000:
+                get_price_line = i
+                break
+
+        check_lines = [
+            "            # soldRatio check (detect holder dumps)\n",
+            "            sr = _check_sold_ratio(chain, ca)\n",
+            "            if sr is not None:\n",
+            "                if sr >= 0.50:\n",
+            "                    log(f'SKIP {sym}: soldRatio={sr:.0%} (holder dump)')\n",
+            "                    continue\n",
+            "                elif sr >= 0.30:\n",
+            "                    log(f'WARN {sym}: soldRatio={sr:.0%} (penalty: +1 consensus)')\n",
+            "                    good_buyers_needed = MIN_CONSENSUS_WALLETS + 1\n",
+            "                    if good_buyers < good_buyers_needed:\n",
+            "                        log(f'SKIP {sym}: soldRatio penalty (good={good_buyers}, need>={good_buyers_needed})')\n",
+            "                        continue\n",
+            "\n",
+        ]
+        insert_at = get_price_line
+        for j, cl in enumerate(check_lines):
+            lines.insert(insert_at + j, cl)
+        changes += 1
+        print(f"  [{label}] +SOLDRATIO check")
+
+    # ---- FEATURE 4: Breakeven tier ----
+    if 'breakeven' not in ''.join(lines):
+        # Find TIME_TIERS line
+        for i, line in enumerate(lines):
+            if line.strip().startswith("TIME_TIERS = ["):
+                time_tiers_line = i
+                break
+        # Insert breakeven tier after TIME_TIERS = [
+        breakeven_lines = [
+            "\n",
+            "    # (hold_hours, SL PnL, TP PnL, sell_pct, label)\n",
+            "\n",
+            "    # breakeven: at +5% sell ~77% to recover cost\n",
+            "    (0,   None, 0.05,  0.77, 'breakeven'),\n",
+            "\n",
+        ]
+        insert_at = time_tiers_line + 1
+        for j, bl in enumerate(breakeven_lines):
+            lines.insert(insert_at + j, bl)
+        changes += 1
+        print(f"  [{label}] +BREAKEVEN tier")
+
+    # Write patched file
+    if changes > 0:
+        with open(filepath, 'w', encoding='utf-8-sig') as f:
+            f.writelines(lines)
+        print(f"  [{label}] wrote {changes} changes")
+    else:
+        print(f"  [{label}] no changes needed")
+
+    return changes
+
+
+def main():
+    print("=== Feature Patch v2 ===\n")
+
+    for fp, label in [(SIM, 'sim'), (MON, 'monitor')]:
+        if os.path.exists(fp):
+            patch_one(fp, label)
+        else:
+            print(f"  [{label}] NOT FOUND")
+
+    print("\n=== Compile check ===")
+    for fp, label in [(SIM, 'sim'), (MON, 'monitor')]:
+        if os.path.exists(fp):
+            try:
+                py_compile.compile(fp, doraise=True)
+                print(f"  [OK] {label}")
+            except py_compile.PyCompileError as e:
+                print(f"  [FAIL] {label}: {e}")
+
+
+if __name__ == '__main__':
+    main()

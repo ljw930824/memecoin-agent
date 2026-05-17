@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 safety_check.py — 买入前安全检查模块（双链共享）
 
