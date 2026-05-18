@@ -87,7 +87,7 @@ def usdt_addr(chain):
 
 
 
-DRY_RUN = False  # ?
+DRY_RUN = False  # 实盘小额测试
 
 STATE_FILE = os.path.join(DATA, 'sm_monitor_state_dryrun.json' if DRY_RUN else 'sm_monitor_state.json')
 CMD_FILE = os.path.join(DATA, 'sm_commands.json')
@@ -105,6 +105,9 @@ SHARED_DEDUP_TTL = 3600
 MIN_MCAP = 10000
 
 MIN_VOLUME = 500
+
+#   Solana 👻
+BLACKLIST_TOKENS = {'6SjVTj1VGwFSXn7wEjwFm77LvACeTqB7sQUebYKX8Ds5'}  # ROUTER 🐸
 
 MAX_POSITIONS = 3
 
@@ -339,27 +342,47 @@ def get_effective_risk(state):
 def calc_buy_size(state):
     """动态仓位: risk_amount / |SL%| = (total x RISK_PCT) / SL_PCT_BASE"""
     try:
-        # 获取 USDT 余额
-        sol_bal = get_balance('solana')
-        bsc_bal = get_balance('bsc')
-        usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
-        usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+        # 获取账户总资产和 USDT 余额（从 onchainos totalValueUsd 取最可靠）
+        sol_out, sol_code = oc_run(['onchainos', 'wallet', 'balance', '--chain', 'solana'], timeout=20)
+        usdt_total = 0
+        if sol_code == 0 and sol_out:
+            d = parse_json(sol_out)
+            if d and d.get('ok'):
+                account_total = float(d.get('data', {}).get('totalValueUsd', 0))
+                # Extract USDT balance from tokenAssets
+                for detail in d.get('data', {}).get('details', []):
+                    for ta in detail.get('tokenAssets', []):
+                        if str(ta.get('chainIndex', '')) != '501': continue
+                        bal = float(ta.get('balance', 0) or 0)
+                        addr = ta.get('tokenAddress', '')
+                        if addr == USDT_SOL and bal > 0:
+                            usdt_total = bal
+                            break
+                    if usdt_total > 0: break
+            else:
+                account_total = 0
+        else:
+            account_total = 0
 
-        # 加上持仓的当前价值
-        positions = state.get('positions', {})
-        pos_value = 0.0
-        for ca, p in positions.items():
-            ep = float(p.get('entry_price', 0) or 0)
-            bal = float(p.get('balance', 0) or 0)
-            pnl = float(p.get('pnl_pct', 0) or 0)
-            remaining = 1.0 - float(p.get('sold_pct', 0))
-            eusd = float(p.get('entry_usd_amount', 0) or 0)
-            if eusd > 0:
-                pos_value += eusd * remaining * (1 + pnl)
-            elif ep > 0 and bal > 0:
-                pos_value += p.get('entry_usd_amount', BUY_SIZE_USDT) * remaining * (1 + pnl)
-
-        account_total = usdt_total + pos_value
+        if account_total <= 0:
+            # Fallback to old method
+            sol_bal = get_balance('solana')
+            bsc_bal = get_balance('bsc')
+            usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
+            usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+            # 加上持仓的当前价值
+            account_total = usdt_total
+            positions = state.get('positions', {})
+            for ca, p in positions.items():
+                ep = float(p.get('entry_price', 0) or 0)
+                bal = float(p.get('balance', 0) or 0)
+                pnl = float(p.get('pnl_pct', 0) or 0)
+                remaining = 1.0 - float(p.get('sold_pct', 0))
+                eusd = float(p.get('entry_usd_amount', 0) or 0)
+                if eusd > 0:
+                    account_total += eusd * remaining * (1 + pnl)
+                elif ep > 0 and bal > 0:
+                    account_total += p.get('entry_usd_amount', BUY_SIZE_USDT) * remaining * (1 + pnl)
         if account_total <= 0:
             return BUY_SIZE_USDT  # fallback
 
@@ -367,7 +390,13 @@ def calc_buy_size(state):
         risk_amount = account_total * effective_risk
         size = risk_amount / SL_PCT_BASE
         size = max(MIN_BUY_SIZE, min(MAX_BUY_SIZE, size))
-        log(f'position_size: account=${account_total:.2f} -> buy=${size:.2f} (risk={effective_risk:.1%})')
+        # 不能超过可用 USDT 余额（留 5% gas buffer）
+        affordable = usdt_total * 0.95 if usdt_total > 0 else 0
+        if size > affordable and affordable >= 1.0:
+            size = round(affordable, 2)
+        elif size > affordable:
+            size = round(usdt_total, 2) if usdt_total > 0 else MIN_BUY_SIZE
+        log(f'position_size: account=${account_total:.2f} -> buy=${size:.2f} (risk={effective_risk:.1%}, usdt=${usdt_total:.2f})')
         return round(size, 2)
     except Exception as e:
         log(f'calc_buy_size error: {e}')
@@ -422,20 +451,34 @@ def check_risk_limits(state):
         if entry_ts >= today_start:
             unrealized_daily += unrealized_pnl
 
-    # 估算账户总资金 (USDT + 持仓价值)
+    # 估算账户总资金 (取 onchainos totalValueUsd + 持仓)
     try:
-        sol_bal = get_balance('solana')
-        bsc_bal = get_balance('bsc')
-        usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
-        usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+        sol_out, sol_code = oc_run(['onchainos', 'wallet', 'balance', '--chain', 'solana'], timeout=20)
+        if sol_code == 0 and sol_out:
+            d = parse_json(sol_out)
+            if d and d.get('ok'):
+                account_total = float(d.get('data', {}).get('totalValueUsd', 0))
+            else:
+                account_total = 0
+        else:
+            account_total = 0
     except:
-        usdt_total = 50.0  # conservative fallback
+        account_total = 0
 
-    pos_value = sum(
-        float(p.get('entry_usd_amount', BUY_SIZE_USDT)) * (1.0 - float(p.get('sold_pct', 0)))
-        for p in state.get('positions', {}).values()
-    )
-    account_total = max(usdt_total + pos_value, 1.0)
+    if account_total <= 0:
+        # Fallback
+        try:
+            sol_bal = get_balance('solana')
+            bsc_bal = get_balance('bsc')
+            usdt_total = sol_bal.get(USDT_SOL.lower(), 0) + sol_bal.get(USDT_SOL, 0)
+            usdt_total += bsc_bal.get(USDT_BSC.lower(), 0)
+        except:
+            usdt_total = 50.0
+        pos_value = sum(
+            float(p.get('entry_usd_amount', BUY_SIZE_USDT)) * (1.0 - float(p.get('sold_pct', 0)))
+            for p in state.get('positions', {}).values()
+        )
+        account_total = max(usdt_total + pos_value, 1.0)
 
     # 日亏损检查
     daily_pnl = realized_daily + unrealized_daily
@@ -692,6 +735,10 @@ def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0
     hold_hours = round((now_ts - entry_ts) / 3600, 2) if entry_ts else 0
     entry_price = float(pos.get('entry_price', 0) or 0)
     entry_usd = float(pos.get('entry_usd_amount', BUY_SIZE_USDT))
+    # Normalize to fraction (e.g., 0.05 = 5%) - some callers pass percentage
+    if abs(exit_pnl_pct) > 1.0:
+        exit_pnl_pct = exit_pnl_pct / 100.0
+    exit_usd_total = entry_usd * (1 + exit_pnl_pct) if entry_usd > 0 else exit_usd
     record = {
         'symbol': pos.get('symbol', '?'),
         'chain': pos.get('chain', 'solana'),
@@ -703,7 +750,7 @@ def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0
         'exit_ts': now_ts,
         'exit_price': exit_price,
         'exit_pnl_pct': round(exit_pnl_pct, 6),
-        'exit_usd': round(exit_usd, 4),
+        'exit_usd': round(exit_usd_total, 4),
         'hold_hours': hold_hours,
         'reason': reason,
     }
@@ -839,7 +886,7 @@ def reconcile_wallet(state):
 
                             price = float(ta.get('tokenPrice', 0) or 0)
 
-                            if addr and bal > 0.01 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL'):
+                            if addr and bal > 0.01 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL') and addr not in BLACKLIST_TOKENS:
 
                                 wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': price, 'chain': 'solana'}
 
@@ -928,7 +975,7 @@ def reconcile_wallet(state):
 
         value_usd = info['balance'] * info['price']
 
-        if ca not in positions and value_usd >= DEAD_POSITION_USD and info['symbol'] and info['symbol'] != '?':
+        if ca not in positions and value_usd >= DEAD_POSITION_USD and info['symbol'] and info['symbol'] != '?' and ca not in BLACKLIST_TOKENS:
 
             sl_price = info['price'] * (1 + SL_PCT)
             pos_data = {'symbol': info['symbol'], 'chain': info['chain'], 'entry_ts': now_ts, 'entry_mcap': 0, 'entry_price': info['price'], 'entry_usd_amount': BUY_SIZE_USDT, 'last_update_ts': now_ts, 'sm_buys': 0, 'sm_sells': 0, 'buy_tx': 'recovered', 'sold_pct': 0.0, 'ladder_step': 0, 'current_price': info['price'], 'pnl_pct': 0.0, 'recovered': True, 'entry_price_est': True, 'sl': sl_price, 'sl_pct': SL_PCT}
@@ -1669,7 +1716,9 @@ def execute_buy(chain, token_ca, amount_usdt):
 
         '--wallet', WALLET,
 
-        '--slippage', '15'
+        '--gas-level', 'fast',
+
+        '--max-auto-slippage', '25'
 
     ], timeout=30)
 
@@ -1738,7 +1787,9 @@ def execute_sell(chain, token_ca, token_balance):
 
         '--wallet', WALLET,
 
-        '--slippage', '20'
+        '--gas-level', 'fast',
+
+        '--max-auto-slippage', '25'
 
     ], timeout=30)
 

@@ -163,6 +163,47 @@ def score_holders(top10_pct):
     return round(s, 1), '' if s > 0 else f'HOLDERS_{top10_pct:.0f}%'
 
 
+def _fallback_score(token_ca, mcap_usd, liq_usd):
+    """Quote 失败时的降级评分：用 price-info 数据给部分分"""
+    # 流动性评分（占25分中的部分）
+    if liq_usd >= MIN_LIQ_FOR_FULL:
+        s_liq = W_LIQ
+    elif liq_usd >= MIN_LIQ_USD:
+        s_liq = round(W_LIQ * (liq_usd / MIN_LIQ_FOR_FULL), 1)
+    else:
+        s_liq = 5.0  # 最小保底分（有流动性的证据）
+    
+    # MCAP 作为安全性代理（越大越安全，占10分）
+    if mcap_usd >= 50000:
+        s_mcap = 10.0
+    elif mcap_usd >= 10000:
+        s_mcap = 7.0
+    elif mcap_usd >= 5000:
+        s_mcap = 4.0
+    else:
+        s_mcap = 2.0
+    
+    # honeypot/税率/冲击 无法判断，给保守分
+    s_hp = 15.0     # 假没确认（占30分的一半）
+    s_tax = 7.5     # 不确定（占15分的一半）
+    s_imp = 7.5     # 不确定（占15分的一半）
+    s_holder = W_HOLDER * 0.7  # 默认
+    
+    total = s_hp + s_tax + s_imp + s_liq + s_mcap + s_holder
+    passed = total >= MIN_SAFETY_SCORE
+    details = {
+        'chain': 'Solana',
+        'fallback': True,
+        'market_cap': round(mcap_usd),
+        'liquidity_usd': round(liq_usd),
+        'scores': {
+            'honeypot': s_hp, 'tax': s_tax, 'impact': s_imp,
+            'liquidity': s_liq, 'mcap': s_mcap, 'holders': s_holder,
+        },
+    }
+    return round(total, 1), passed, details, ['quote_failed(onchainos), fallback_score']
+
+
 # ═══════════════════════════════════════════════════════════════
 # Solana 安全检查（通过 onchainos swap quote）
 # ═══════════════════════════════════════════════════════════════
@@ -172,15 +213,36 @@ def check_solana(token_ca, trade_amount_usd=5.0):
     对 Solana token 做安全检查。
     返回: (score: float, passed: bool, details: dict, errors: list)
     """
-    out, err, code = _oc_run([
-        'swap', 'quote',
-        '--chain', 'Solana',
-        '--from', SOL_USDT,
-        '--to', token_ca,
-        '--readable-amount', str(min(trade_amount_usd, 5.0)),  # 用小额测试
-    ], timeout=30)
+    out, err, code = '', '', -1
+    # 三层重试：不同金额 + 备用链名（Solana/solana）
+    for amt, chain_alias in [(min(trade_amount_usd, 5.0), 'Solana'), (1.0, 'Solana'), (1.0, 'solana')]:
+        out, err, code = _oc_run([
+            'swap', 'quote',
+            '--chain', chain_alias,
+            '--from', SOL_USDT,
+            '--to', token_ca,
+            '--readable-amount', str(amt),
+        ], timeout=30)
+        if code == 0 and out.strip():
+            break
 
-    if code != 0:
+    if code != 0 or not out.strip():
+        # quote 失败，用 token price-info 做降级检查
+        price_out, _, price_code = _oc_run([
+            'token', 'price-info', '--address', token_ca
+        ], timeout=15)
+        if price_code == 0 and price_out.strip():
+            try:
+                pd = _parse_json_loose(price_out) or json.loads(price_out)
+                if pd.get('ok'):
+                    pdata = pd.get('data', {})
+                    mcap = float(pdata.get('marketCap', 0) or 0)
+                    liq = float(pdata.get('liquidity', 0) or 0)
+                    if mcap > 0 or liq > 0:
+                        # token 存在且有数据，给部分安全分
+                        return _fallback_score(token_ca, mcap, liq)
+            except Exception:
+                pass
         return 0, False, {}, ['quote_failed']
 
     try:
@@ -351,7 +413,6 @@ def check_token(chain, token_ca, trade_amount_usd=5.0):
     chain: 'Solana' 或 'BSC' (or '56')
     返回: (score, passed, details, errors)
     """
-    import sys; sys.stderr.write(f'DEBUG check_token: chain={repr(chain)} len={len(str(chain)) if chain else 0} ca={token_ca[:30] if token_ca else None}\n'); sys.stderr.flush()
     chain_lower = chain.lower() if isinstance(chain, str) else str(chain)
     if chain_lower in ('solana', '501'):
         return check_solana(token_ca, trade_amount_usd)

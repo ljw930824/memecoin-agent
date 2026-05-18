@@ -24,3 +24,28 @@
 ## 平台格式
 - Discord/WhatsApp 不用表格，用列表
 - WhatsApp 不用标题，用粗体
+
+## 模型路由（必须遵守）
+
+当检测到以下任一关键词，强制使用 `kimi-plan`（Kimi）：
+
+### 交易相关
+/sell /buy /swap /开仓 /平仓 /止损 /止盈 /限价 /市价
+monitor /sim /dryrun /实盘 /模拟
+scalper /baw /onchainos /okx
+
+### 策略相关
+strategy /策略 /入场 /出场 /风控
+soldRatio /wr /胜率 /钱包分析
+
+### 代码/脚本相关
+.py /powershell /baw /execute
+safety_check /watchdog /run_unified
+
+### 工具类
+baw auth /baw wallet /baw market-order
+onchainos token /onchainos swap
+
+---
+
+当没有以上关键词时，默认使用 `qclaw/modelroute`（Auto）。
