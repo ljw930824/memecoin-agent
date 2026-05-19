@@ -1584,7 +1584,7 @@ def get_balance(chain='solana'):
 
                             if addr and bal > 0 and addr != 'So11111111111111111111111111111111111111111':
 
-                                result[addr] = bal
+                                result[addr.lower()] = bal
 
                     if result:
 
@@ -1771,43 +1771,47 @@ def execute_sell(chain, token_ca, token_balance):
 
         return bsc_market_sell(token_ca, round(token_balance, 6))
 
-    # Solana
+    # Solana - retry with increasingly wide slippage
 
-    out, _ = oc_run([
+    for slippage in [25, 35, 49]:
 
-        'onchainos', 'swap', 'execute',
+        out, _ = oc_run([
 
-        '--chain', chain,
+            'onchainos', 'swap', 'execute',
 
-        '--from', token_ca,
+            '--chain', chain,
 
-        '--to', usdt_addr(chain),
+            '--from', token_ca,
 
-        '--readable-amount', str(round(token_balance, 6)),
+            '--to', usdt_addr(chain),
 
-        '--wallet', WALLET,
+            '--readable-amount', str(round(token_balance, 6)),
 
-        '--gas-level', 'fast',
+            '--wallet', WALLET,
 
-        '--max-auto-slippage', '25'
+            '--gas-level', 'fast',
 
-    ], timeout=30)
+            '--max-auto-slippage', str(slippage)
 
-    d = parse_json(out)
+        ], timeout=30)
 
-    if d and d.get('ok'):
+        d = parse_json(out)
 
-        tx = d['data'].get('swapTxHash', '')
+        if d and d.get('ok'):
 
-        got = int(d['data'].get('toAmount', 0)) / 1e6
+            tx = d['data'].get('swapTxHash', '')
 
-        log(f'SELL OK: tx={tx[:20]}... got=${got:.2f}')
+            got = int(d['data'].get('toAmount', 0)) / 1e6
 
-        return True, tx
+            log(f'SELL OK (slippage={slippage}%): tx={tx[:20]}... got=${got:.2f}')
+
+            return True, tx
+
+        time.sleep(2)
 
     err = d.get('error', 'unknown') if d else out[:100]
 
-    log(f'SELL FAIL: {err}')
+    log(f'SELL FAIL (all slippage): {err}')
 
     return False, None
 
@@ -1910,7 +1914,7 @@ def process_new_trades(trades, state, wallets):
 
         # ?token ?
         # Dedup: skip if recently bought (crash-recovery protection)
-        recent_trades = [t for t in state.get('trade_history', [])
+        recent_trades = [t for t in state.get('buy_signals', [])
             if t.get('contract_address') == ca and t.get('reason') in ('buy','sm_buy')
             and now - t.get('ts', 0) < 3600]
         if recent_trades:
@@ -2078,20 +2082,25 @@ def process_new_trades(trades, state, wallets):
                     except: pass
                 elif chain == 'solana' and not DRY_RUN:
                     try:
-                        time.sleep(2)
-                        bal_now = get_balance('solana')
-                        pos_data['balance'] = bal_now.get(ca.lower(), 0)
+                        got = 0
+                        for _retry in range(5):
+                            time.sleep(3)
+                            bal_now = get_balance('solana')
+                            got = bal_now.get(ca.lower(), 0)
+                            if got > 0:
+                                break
+                        pos_data['balance'] = got
                     except: pass
                 positions[ca] = pos_data
                 # Record in trade_history for dedup (cross-cycle protection)
                 _record_shared_dedup(ca, chain, sym)
 
-                state.setdefault('trade_history', []).append({
+                state.setdefault('buy_signals', []).append({
                     'contract_address': ca, 'symbol': sym, 'reason': 'sm_buy',
                     'ts': int(time.time()), 'amount_usd': dynamic_buy, 'chain': chain
                 })
-                if len(state.get('trade_history', [])) > 500:
-                    state['trade_history'] = state['trade_history'][-500:]
+                if len(state.get('buy_signals', [])) > 500:
+                    state['buy_signals'] = state['buy_signals'][-500:]
                 save_state(state)  # immediate persist after buy (dedup + crash protection)
 
     return positions
@@ -2367,33 +2376,42 @@ def check_positions(positions, state=None):
 
         else:
 
-            bal_info = get_balance(chain)
-
-            token_bal = bal_info.get(ca, 0)
+            # Primary: use stored balance from buy-time (reliable, no API call)
+            token_bal = pos.get('balance', 0)
+            # Fallback: get_balance API (with retry)
+            if token_bal <= 0:
+                for _retry in range(3):
+                    bal_info = get_balance(chain)
+                    token_bal = bal_info.get(ca.lower(), 0)
+                    if token_bal > 0:
+                        pos['balance'] = token_bal
+                        break
+                    time.sleep(2)
 
         if token_bal > 0:
 
-            ok, _ = execute_sell(chain, ca, round(token_bal, 6))
+            ok, tx_id = execute_sell(chain, ca, round(token_bal, 6))
 
         else:
 
-            # Dead position: token not in wallet (already sold or token died)
-
-            log(f'  {sym}: balance=0, cleaning dead position')
-
+            # Balance still 0: try selling with estimated balance from entry data
+            remaining = 1.0 - float(pos.get('sold_pct', 0))
             entry_price = float(pos.get('entry_price', 0) or 0)
-
+            entry_usd = float(pos.get('entry_usd_amount', 0) or 0)
             current_price = float(pos.get('current_price', entry_price))
-
-            exit_pnl = (current_price - entry_price) / entry_price if entry_price > 0 else 0
-
-            _save_trade_history(state, pos, current_price, exit_pnl, f'{reason}_dead', 0)
-
-            del positions[ca]
-
-            save_state()
-
-            continue
+            if remaining > 0 and entry_price > 0 and entry_usd > 0:
+                # Try selling with estimated balance from entry data
+                est_bal = (entry_usd * remaining) / entry_price
+                log(f'  {sym}: balance api=0, selling est_bal={est_bal:.2f} (from entry)')
+                ok, tx_id = execute_sell(chain, ca, round(est_bal, 6))
+            else:
+                # Truly dead: clean up
+                log(f'  {sym}: balance=0, cleaning dead position')
+                exit_pnl = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+                _save_trade_history(state, pos, current_price, exit_pnl, f'{reason}_dead', 0)
+                del positions[ca]
+                save_state(state)
+                continue
 
             if ok:
 

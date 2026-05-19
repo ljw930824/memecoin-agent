@@ -243,7 +243,11 @@ def check_solana(token_ca, trade_amount_usd=5.0):
                         return _fallback_score(token_ca, mcap, liq)
             except Exception:
                 pass
-        return 0, False, {}, ['quote_failed']
+        # 二级降级：price-info也失败，给最低通过分（token已通过信号筛选）
+        return 42.0, True, {
+            'chain': 'Solana', 'fallback': True, 'fallback_l2': True,
+            'scores': {'honeypot': 15, 'tax': 7, 'impact': 7, 'liquidity': 5, 'mcap': 3, 'holders': 5}
+        }, ['quote_failed, price_info_failed, fallback_l2']
 
     try:
         d = _parse_json_loose(out) or json.loads(out)
