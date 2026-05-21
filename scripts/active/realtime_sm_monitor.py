@@ -102,7 +102,7 @@ SHARED_DEDUP_TTL = 3600
 
 
 
-MIN_MCAP = 20000
+MIN_MCAP = 15000
 
 MIN_VOLUME = 500
 
@@ -141,7 +141,7 @@ CONSEC_SL_FREEZE_SEC = 7200
 
 TRACKER_POLL_SEC = 10
 
-MIN_WALLET_WINRATE = 0.5
+MIN_WALLET_WINRATE = 0.50
 
 MIN_CONSENSUS_WALLETS = 2
 
@@ -2053,6 +2053,15 @@ def process_new_trades(trades, state, wallets):
 
 
 
+            # Signal freshness: skip if SM signal > 60s old
+            sig_age = int(time.time() * 1000) - int(lat.get('tradeTime', 0))
+            if sig_age > 60000:
+                log(f'SKIP {sym}: stale signal ({sig_age//1000}s old)')
+                continue
+            # Concurrent sell filter: skip if SM is also selling this token
+            if act['sells'] >= act['buys']:
+                log(f'SKIP {sym}: SM selling (b={act["buys"]} s={act["sells"]})')
+                continue
             # soldRatio check
             sr = _check_sold_ratio(chain, ca)
             if sr is not None:
@@ -2070,6 +2079,17 @@ def process_new_trades(trades, state, wallets):
             if not entry_price or entry_price <= 0:
 
                 log(f'SKIP {sym}: cannot get price')
+
+                continue
+
+            # Entry timing: skip if price already dropped >2% below signal reference
+            signal_price = float(lat.get('tokenPrice', 0) or 0)
+
+            if signal_price > 0 and entry_price / signal_price < 0.98:
+
+                drop_pct = (1 - entry_price / signal_price) * 100
+
+                log(f'SKIP {sym}: price dropped {drop_pct:.1f}% from signal (arrived late)')
 
                 continue
 
@@ -2335,12 +2355,15 @@ def check_positions(positions, state=None):
 
         # ?
 
-        if pos.get('sm_sells', 0) >= SM_SELL_FOLLOW:
-
-            log(f'SM FOLLOW SELL: {sym} (sm_sells={pos["sm_sells"]})')
-
+        # SM follow sell: trigger only on NEW sells (not cumulative)
+        prev = pos.get('_prev_sm_sells', 0)
+        curr = pos.get('sm_sells', 0)
+        new_s = max(0, curr - prev)
+        pos['_prev_sm_sells'] = curr
+        if new_s >= SM_SELL_FOLLOW:
+            log(f'SM FOLLOW SELL: {sym} (+{new_s}new, total={curr})')
             to_sell_all.append((ca, 'sm_follow'))
-
+            continue
             continue
 
 
@@ -2429,6 +2452,34 @@ def check_positions(positions, state=None):
 
 
         effective_sl = (dynamic_sl if dynamic_sl is not None else SL_PCT) + trend_adj  # double guard
+
+        # Trailing stop: lock profits
+
+        trailing_sl = pos.get('trailing_sl', None)
+
+        if pnl >= 0.20:
+
+            trailing_sl = 0.10
+
+        elif pnl >= 0.10:
+
+            trailing_sl = 0.05
+
+        elif pnl >= 0.05:
+
+            trailing_sl = 0.02
+
+        if trailing_sl is not None:
+
+            pos['trailing_sl'] = trailing_sl
+
+            if pnl <= trailing_sl and hold_hours > 0.1:
+
+                log(f'TRAIL: {sym} PnL={pnl:.1%} < trailing_sl={trailing_sl:.0%} -> lock')
+
+                to_sell_all.append((ca, 'trailing_stop'))
+
+                continue
 
         if pnl <= effective_sl:
 
