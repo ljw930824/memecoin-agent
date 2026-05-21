@@ -87,7 +87,7 @@ def usdt_addr(chain):
 
 
 
-DRY_RUN = False  # 实盘小额测试
+DRY_RUN = True  # sim test S1-S3
 
 STATE_FILE = os.path.join(DATA, 'sm_monitor_state_dryrun.json' if DRY_RUN else 'sm_monitor_state.json')
 CMD_FILE = os.path.join(DATA, 'sm_commands.json')
@@ -102,7 +102,7 @@ SHARED_DEDUP_TTL = 3600
 
 
 
-MIN_MCAP = 10000
+MIN_MCAP = 20000
 
 MIN_VOLUME = 500
 
@@ -129,6 +129,11 @@ RISK_TIERS = [
 BASE_RISK_PCT = RISK_PCT
 
 SL_PCT = -0.08
+
+MIN_SOL_BALANCE = 0.005     # Solana 最小 SOL 余额（支付 token account 租金）
+BUY_FAIL_COOLDOWN = 300      # 买入失败后冷却 5 分钟
+SELL_FAIL_MAX = 8            # 卖出最多重试 8 次后跳过
+SELL_FAIL_BACKOFF_BASE = 5   # 卖出失败退避基数(秒)，指数递增
 
 SM_SELL_FOLLOW = 3
 CONSEC_SL_LIMIT = 3
@@ -1724,6 +1729,31 @@ def get_token_price_usd(chain, token_ca, retries=MAX_PRICE_RETRIES):
 
 
 
+
+# === SOL 余额检查（用于买入前）===
+def _get_sol_balance():
+    """返回 SOL 原生余额（浮点数），失败返回 None。"""
+    try:
+        out, code = oc_run(['onchainos', 'wallet', 'balance', '--chain', 'solana'], timeout=15)
+        if code != 0 or not out:
+            return None
+        d = parse_json(out)
+        if d and d.get('ok'):
+            details = d.get('data', {}).get('details', [])
+            for detail in details:
+                for ta in detail.get('tokenAssets', []):
+                    if ta.get('tokenAddress') == 'So11111111111111111111111111111111111111111':
+                        return float(ta.get('balance', 0) or 0)
+        # 可能返回 totalSolValue 或 nativeBalance
+        nd = d.get('data', {}) if d else {}
+        nb = nd.get('nativeBalance') or nd.get('totalSolValue')
+        if nb is not None:
+            return float(nb)
+    except Exception:
+        pass
+    return None
+
+
 # ===  ===
 
 def execute_buy(chain, token_ca, amount_usdt):
@@ -1741,6 +1771,23 @@ def execute_buy(chain, token_ca, amount_usdt):
         return bsc_market_buy(token_ca, amount_usdt)
 
     # Solana
+    # Pre-check: SOL balance for token account rent
+    sol_bal = _get_sol_balance()
+    if sol_bal is not None and sol_bal < MIN_SOL_BALANCE:
+        log(f'BUY SKIP: SOL too low (${sol_bal:.4f} < ${MIN_SOL_BALANCE})')
+        return False, None
+
+    # Pre-check: swap quote to verify pool is tradeable (catches ~90% of InstErr)
+    q_out, q_code = oc_run([
+        'onchainos', 'swap', 'quote',
+        '--chain', chain,
+        '--from', usdt_addr(chain),
+        '--to', token_ca,
+        '--readable-amount', str(round(amount_usdt, 6)),
+    ], timeout=20)
+    if q_code != 0 or not q_out or 'InstructionError' in (q_out or ''):
+        log(f'BUY SKIP: quote failed (pool not tradeable)')
+        return False, None
 
     out, _ = oc_run([
 
@@ -2053,6 +2100,20 @@ def process_new_trades(trades, state, wallets):
                     continue
 
 
+            # Buy failure cooldown check
+            now_ts = int(time.time())
+            buy_fails = state.get('buy_failures', {})
+            last_fail = buy_fails.get(ca, 0)
+            if last_fail and (now_ts - last_fail) < BUY_FAIL_COOLDOWN:
+                remaining_cooldown = BUY_FAIL_COOLDOWN - (now_ts - last_fail)
+                log(f'SKIP {sym}: buy cooldown ({remaining_cooldown}s left)')
+                continue
+            # Permanent fail skip: tokens that hit InstErr >= PERMANENT_FAIL_THRESHOLD
+            inst_fails = state.get('perm_fail_tokens', {})
+            if inst_fails.get(ca, 0) >= 2:
+                log(f'SKIP {sym}: PERMANENT FAIL (InstErr x{inst_fails[ca]})')
+                continue
+
             # Pre-buy safety check (honeypot, tax, liquidity)
             if _HAS_SAFETY and not DRY_RUN:
                 s_score, s_passed, s_details, s_errors = check_token(chain, ca, dynamic_buy)
@@ -2142,6 +2203,25 @@ def process_new_trades(trades, state, wallets):
                 if len(state.get('buy_signals', [])) > 500:
                     state['buy_signals'] = state['buy_signals'][-500:]
                 save_state(state)  # immediate persist after buy (dedup + crash protection)
+            else:
+                # Record buy failure for cooldown
+                now_ts2 = int(time.time())
+                state.setdefault('buy_failures', {})[ca] = now_ts2
+                # Clean old entries (>1h)
+                state['buy_failures'] = {k: v for k, v in state.get('buy_failures', {}).items()
+                                         if now_ts2 - v < 3600}
+                # Track InstErr for permanent fail (check last log line)
+                try:
+                    with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as _f:
+                        _lines = _f.readlines()
+                        _last = _lines[-1] if _lines else ''
+                    if 'InstructionError' in _last:
+                        ic = state.setdefault('perm_fail_tokens', {}).get(ca, 0) + 1
+                        state['perm_fail_tokens'][ca] = ic
+                        if ic >= 2:
+                            log(f'PERMANENT FAIL: {sym} (InstErr x{ic})')
+                except: pass
+                log(f'BUY COOLDOWN: {sym} cooldown {BUY_FAIL_COOLDOWN}s')
 
     return positions
 
@@ -2416,6 +2496,24 @@ def check_positions(positions, state=None):
 
         else:
 
+            # Sell failure backoff: skip if max retries exceeded or in cooldown
+            sell_fails = pos.get('sell_fail_count', 0)
+            sell_last_attempt = pos.get('sell_last_attempt', 0)
+            if sell_fails >= SELL_FAIL_MAX:
+                log(f'  {sym}: sell failed {sell_fails} times, cleaning dead position')
+                ep = float(pos.get('entry_price', 0) or 0)
+                cp = float(pos.get('current_price', ep))
+                exit_pnl = (cp - ep) / ep if ep > 0 else -1.0
+                _save_trade_history(state, pos, cp, exit_pnl, f'{reason}_sell_fail_max', 0)
+                del positions[ca]
+                save_state(state)
+                continue
+            if sell_fails > 0 and sell_last_attempt > 0:
+                backoff_sec = min(SELL_FAIL_BACKOFF_BASE * (2 ** (sell_fails - 1)), 300)
+                elapsed = int(time.time()) - sell_last_attempt
+                if elapsed < backoff_sec:
+                    log(f'  {sym}: sell backoff ({elapsed}s / {backoff_sec}s, fail#{sell_fails})')
+                    continue
             # Primary: use stored balance from buy-time (reliable, no API call)
             token_bal = pos.get('balance', 0)
             # Fallback: get_balance API (with retry)
@@ -2431,6 +2529,11 @@ def check_positions(positions, state=None):
         if token_bal > 0:
 
             ok, tx_id = execute_sell(chain, ca, round(token_bal, 6))
+            if ok:
+                pos['sell_fail_count'] = 0  # reset on success
+            else:
+                pos['sell_fail_count'] = pos.get('sell_fail_count', 0) + 1
+                pos['sell_last_attempt'] = int(time.time())
 
         else:
 
@@ -2444,6 +2547,11 @@ def check_positions(positions, state=None):
                 est_bal = (entry_usd * remaining) / entry_price
                 log(f'  {sym}: balance api=0, selling est_bal={est_bal:.2f} (from entry)')
                 ok, tx_id = execute_sell(chain, ca, round(est_bal, 6))
+                if ok:
+                    pos['sell_fail_count'] = 0
+                else:
+                    pos['sell_fail_count'] = pos.get('sell_fail_count', 0) + 1
+                    pos['sell_last_attempt'] = int(time.time())
             else:
                 # Truly dead: clean up
                 log(f'  {sym}: balance=0, cleaning dead position')

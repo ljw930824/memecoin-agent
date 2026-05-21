@@ -244,7 +244,7 @@ def check_solana(token_ca, trade_amount_usd=5.0):
             except Exception:
                 pass
         # 二级降级：price-info也失败，给最低通过分（token已通过信号筛选）
-        return 42.0, True, {
+        return 35.0, False, {
             'chain': 'Solana', 'fallback': True, 'fallback_l2': True,
             'scores': {'honeypot': 15, 'tax': 7, 'impact': 7, 'liquidity': 5, 'mcap': 3, 'holders': 5}
         }, ['quote_failed, price_info_failed, fallback_l2']
