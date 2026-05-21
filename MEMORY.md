@@ -21,6 +21,7 @@
 - 单笔: $5 | 最大持仓: 3 | 链: Solana + BSC
 - 风控: 动态风险调整（基础2%风险系数，日亏>2%降到1.5%，>3.5%降到1%，>5%停止交易） | 连续 3 SL 冻结 2h | 时间加权止损（6h/-5%, 12h/-3%, 24h/保本, 48h/强平）
 - watchdog.ps1 (Task Scheduler 每2分钟检查进程存活，-WindowStyle Hidden 隐藏运行，dead自动重启)
+- [2026-05-21] Task Scheduler 精简：仅保留 SMMonitorWatchdog，删除旧架构4个任务（MonitorPositions/SmartMoneySignals/SmartMoneyUnified/SmartMoneyHealth）。v3.2已合并信号+执行+仓位到 realtime_sm_monitor.py 一个脚本
 - State 文件: 实盘 `sm_monitor_state.json`，模拟盘 `sm_monitor_state_dryrun.json`（已分离）
 - 买入前安全检查: safety_check.py 五维评分（蜜罐30/税率15/冲击15/流动性25/持币集中度15），score>=40 开仓，>=60 优先，Solana+BSC 双链共享
 - Sim/Monitor主循环已添加错误处理：run_once()包裹try/except，API错误不再杀进程，自动保存状态+3x sleep后重试
