@@ -2582,6 +2582,12 @@ def check_positions(positions, state=None):
             ok, tx_id = execute_sell(chain, ca, round(token_bal, 6))
             if ok:
                 pos['sell_fail_count'] = 0  # reset on success
+                exit_price = float(pos.get('current_price', pos.get('entry_price', 0)))
+                ep = float(pos.get('entry_price', 0) or 0)
+                exit_pnl = (exit_price - ep) / ep if ep > 0 else 0
+                exit_usd = token_bal * exit_price
+                _save_trade_history(state, pos, exit_price, exit_pnl, reason, exit_usd)
+                del positions[ca]
             else:
                 pos['sell_fail_count'] = pos.get('sell_fail_count', 0) + 1
                 pos['sell_last_attempt'] = int(time.time())
