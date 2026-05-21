@@ -886,7 +886,7 @@ def reconcile_wallet(state):
 
                             price = float(ta.get('tokenPrice', 0) or 0)
 
-                            if addr and bal > 0.01 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL') and addr not in BLACKLIST_TOKENS:
+                            if addr and bal > 0 and sym not in ('USDT', 'USDC', 'SOL', 'wSOL') and addr not in BLACKLIST_TOKENS:
 
                                 wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': price, 'chain': 'solana'}
 
@@ -1024,7 +1024,47 @@ def reconcile_wallet(state):
 
             pos = positions[ca]
 
-            log('reconcile: -' + pos.get('symbol', '?') + ' gone -> removed')
+            sym = pos.get('symbol', '?')
+
+            chain = pos.get('chain', 'solana')
+
+            orphan_bal = pos.get('balance', 0)
+
+            # Auto-sell orphan tokens before removing, unless blacklisted
+
+            if orphan_bal > 0 and ca not in BLACKLIST_TOKENS:
+
+                log(f'reconcile: {sym} orphan balance={orphan_bal}, selling...')
+
+                try:
+
+                    ok, tx = execute_sell(chain, ca, orphan_bal)
+
+                    if ok:
+
+                        log(f'reconcile: {sym} orphan sold tx={str(tx)[:20]}')
+
+                        # Record trade in history
+
+                        pnl = float(pos.get('sold_pct', 0)) * BUY_SIZE_USDT / 100.0
+
+                        _save_trade_history(state, ca, sym, chain, 'sold', float(pos.get('entry_price', 0)),
+
+                                           BUY_SIZE_USDT, now_ts,
+
+                                           pnl_pct=pnl / BUY_SIZE_USDT * 100 if BUY_SIZE_USDT > 0 else 0,
+
+                                           reason='orphan_cleanup')
+
+                    else:
+
+                        log(f'reconcile: {sym} orphan sell FAIL: {tx}')
+
+                except Exception as e:
+
+                    log(f'reconcile: {sym} orphan sell error: {e}')
+
+            log('reconcile: -' + sym + ' gone -> removed')
 
             removed += 1
 
