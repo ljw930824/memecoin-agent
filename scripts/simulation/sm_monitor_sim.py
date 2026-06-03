@@ -1226,13 +1226,13 @@ def oc_run(cmd, timeout=20):
         env = os.environ.copy()
 
 
-        env['OKX_PROD_API_KEY'] = env.get('OKX_PROD_API_KEY') or env.get('OKX_API_KEY', '***REMOVED***')
+        env['OKX_PROD_API_KEY'] = env.get('OKX_PROD_API_KEY') or env.get('OKX_API_KEY')
 
 
-        env['OKX_PROD_SECRET_KEY'] = env.get('OKX_PROD_SECRET_KEY') or env.get('OKX_SECRET_KEY', '***REMOVED***')
+        env['OKX_PROD_SECRET_KEY'] = env.get('OKX_PROD_SECRET_KEY') or env.get('OKX_SECRET_KEY')
 
 
-        env['OKX_PROD_PASSPHRASE'] = env.get('OKX_PROD_PASSPHRASE') or env.get('OKX_PASSPHRASE', '***REMOVED***')
+        env['OKX_PROD_PASSPHRASE'] = env.get('OKX_PROD_PASSPHRASE') or env.get('OKX_PASSPHRASE')
 
 
         env['OKX_API_KEY'] = env['OKX_PROD_API_KEY']
