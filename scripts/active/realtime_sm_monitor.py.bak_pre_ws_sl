@@ -18,7 +18,6 @@ onchainos tracker activities REST
 
 import sys
 import json, sys, os, subprocess, re, time
-import threading
 
 from datetime import datetime, timezone, timedelta
 
@@ -40,7 +39,6 @@ sys.stdout.reconfigure(encoding='utf-8')
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _WS_CLIENT = None  # WebSocket primary data source (direct OKX DEX WS v6)
 _price_cache = {}  # {token_ca_lower: (price_float, timestamp)}
-_ws_sl_lock = None  # threading.Lock — WS instant SL thread safety (init in main)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from okx_dex_ws import OkxDexWs
@@ -1225,7 +1223,7 @@ def is_good_wallet(wallets, addr):
 
 # ===  ===
 
-def fetch_tracker(state=None):
+def fetch_tracker():
 
     """Fetch recent smart money trades -- WS primary, REST fallback."""
 
@@ -1245,8 +1243,6 @@ def fetch_tracker(state=None):
                         _price_cache[_ca] = (_price, _now)
                 except (ValueError, TypeError):
                     pass
-            # WS instant SL: check held positions against fresh WS prices
-            _ws_instant_sl_check(state)
             return ws_trades
 
     # REST fallback (onchainos CLI) when WS is down or has no events
@@ -1274,162 +1270,6 @@ def fetch_tracker(state=None):
 
     return all_trades
 
-
-
-
-def _ws_instant_sl_check(state):
-    """WS-driven instant stop-loss: check held positions against latest WS prices.
-    Called from fetch_tracker() when WS price_cache is updated.
-    Thread-safe via _ws_sl_lock. Only handles: stop_loss, trailing_stop, quick_tp (first tier).
-    Full tier logic (6h_tp, 12h_tp, etc.) still handled by check_positions() in run_once().
-    """
-    if _ws_sl_lock is None:
-        return  # not initialized yet
-    if not _ws_sl_lock.acquire(blocking=False):
-        return  # check_positions() is running, skip to avoid race
-
-    try:
-        positions = state.get('positions', {})
-        if not positions:
-            return
-
-        now_ts = int(time.time())
-        to_sell = []  # list of (ca, reason, sell_pct)
-
-        for ca, pos in list(positions.items()):
-            ca_lower = ca.lower()
-            cached = _price_cache.get(ca_lower)
-            if not cached:
-                continue  # no WS price for this token
-
-            ws_price, ws_ts = cached
-            # Only use WS price if it's fresh (< 5s old)
-            if time.time() - ws_ts > 5:
-                continue
-
-            entry_price = float(pos.get('entry_price', 0) or 0)
-            if entry_price <= 0:
-                continue
-
-            chain = pos.get('chain', 'solana')
-            sym = pos.get('symbol', '?')
-            pnl = (ws_price - entry_price) / entry_price
-            hold_hours = (now_ts - int(pos.get('entry_ts', now_ts))) / 3600
-
-            # Update position price immediately
-            pos['current_price'] = ws_price
-            pos['pnl_pct'] = pnl
-            pos['last_update_ts'] = now_ts
-
-            # ── Stop-loss check ──
-            dynamic_sl = SL_PCT  # -0.08
-            # Apply TIME_TIERS SL override
-            for tier_hours, tier_sl, tier_tp, sell_pct, label in TIME_TIERS:
-                if hold_hours < tier_hours:
-                    break
-                if tier_sl is not None:
-                    dynamic_sl = tier_sl
-
-            # Trend adjustment (simplified — use cached trend if available)
-            trend_3m = get_trend(ca, 180)
-            trend_15m = get_trend(ca, 900)
-            trend_adj = 0.0
-            if trend_15m < -0.02:
-                trend_adj += 0.02
-            if trend_3m < -0.05:
-                trend_adj += 0.03
-
-            effective_sl = dynamic_sl + trend_adj
-
-            if pnl <= effective_sl:
-                log(f'[WS-SL] {sym} PnL={pnl:+.1%} <= SL={effective_sl:+.0%} hold={hold_hours:.1f}h -> INSTANT SELL')
-                to_sell.append((ca, 'stop_loss', 1.0))
-                continue
-
-            # ── Trailing stop check ──
-            trailing_sl = pos.get('trailing_sl', None)
-            if pnl >= 0.20:
-                trailing_sl = 0.10
-            elif pnl >= 0.10:
-                trailing_sl = 0.05
-            elif pnl >= 0.05:
-                trailing_sl = 0.02
-
-            if trailing_sl is not None:
-                pos['trailing_sl'] = trailing_sl
-                if pnl <= trailing_sl and hold_hours > 0.1:
-                    log(f'[WS-TRAIL] {sym} PnL={pnl:+.1%} <= trail={trailing_sl:.0%} -> INSTANT SELL')
-                    to_sell.append((ca, 'trailing_stop', 1.0))
-                    continue
-
-            # ── Quick TP (first tier only: +10% sell 30%) ──
-            if hold_hours < TIME_TIERS[0][0] or hold_hours >= TIME_TIERS[0][0]:
-                # TIME_TIERS[0] = (0, None, 0.10, 0.30, 'quick_tp')
-                if pnl >= TIME_TIERS[0][2]:  # 0.10 = +10%
-                    ladder_step = int(pos.get('ladder_step', 0))
-                    if ladder_step < 1:  # only first quick_tp tier
-                        log(f'[WS-TP] {sym} PnL={pnl:+.1%} >= +10% -> quick_tp 30%')
-                        to_sell.append((ca, 'quick_tp', 0.30))
-                        pos['ladder_step'] = 1
-                        continue
-
-        # ── Execute sells ──
-        for ca, reason, sell_pct in to_sell:
-            pos = positions.get(ca)
-            if not pos:
-                continue
-
-            chain = pos.get('chain', 'solana')
-            sym = pos.get('symbol', '?')
-            entry_price = float(pos.get('entry_price', 0) or 0)
-            current_price = float(pos.get('current_price', entry_price))
-            exit_pnl = (current_price - entry_price) / entry_price if entry_price > 0 else -1.0
-
-            if sell_pct >= 1.0:
-                # Full sell
-                remaining = 1.0 - float(pos.get('sold_pct', 0))
-                token_bal = (BUY_SIZE_USDT * remaining) / entry_price if entry_price > 0 else 0
-
-                if DRY_RUN:
-                    log(f'[DRY][WS] SELL ALL {sym} reason={reason} PnL={exit_pnl:+.1%}')
-                else:
-                    ok, tx = execute_sell(chain, ca, round(token_bal, 6))
-                    if ok:
-                        log(f'[WS] SELL OK {sym} reason={reason} tx={tx[:20]}...')
-                    else:
-                        log(f'[WS] SELL FAIL {sym} reason={reason}')
-                        pos['sell_fail_count'] = pos.get('sell_fail_count', 0) + 1
-                        pos['sell_last_attempt'] = int(time.time())
-                        continue  # skip removal, let check_positions retry
-
-                _save_trade_history(state, pos, current_price, exit_pnl, reason, sell_pct)
-                del positions[ca]
-            else:
-                # Partial sell (quick_tp 30%)
-                remaining = 1.0 - float(pos.get('sold_pct', 0))
-                sell_amount = remaining * sell_pct
-                token_bal = (BUY_SIZE_USDT * remaining) / entry_price if entry_price > 0 else 0
-                sell_bal = token_bal * sell_pct
-
-                if DRY_RUN:
-                    log(f'[DRY][WS] SELL {sell_pct:.0%} {sym} reason={reason} PnL={exit_pnl:+.1%}')
-                else:
-                    ok, tx = execute_sell(chain, ca, round(sell_bal, 6))
-                    if ok:
-                        log(f'[WS] PARTIAL SELL OK {sym} {sell_pct:.0%} reason={reason}')
-                    else:
-                        log(f'[WS] PARTIAL SELL FAIL {sym}')
-                        continue
-
-                _save_trade_history(state, pos, current_price, exit_pnl, reason, sell_pct)
-                pos['sold_pct'] = float(pos.get('sold_pct', 0)) + sell_pct
-
-        if to_sell:
-            state['positions'] = positions
-            save_state(state)
-
-    finally:
-        _ws_sl_lock.release()
 
 
 # === BSC  ===
@@ -2961,7 +2801,7 @@ def run_once(state, wallets):
     save_state(state)  # persist command results immediately (cmd file already cleared)
     positions = state.get("positions", {})  # refresh after commands
 
-    trades = fetch_tracker(state)
+    trades = fetch_tracker()
 
     # Update held positions' current_price from WS price cache (immediate, no REST call)
     _now = time.time()
@@ -3060,8 +2900,7 @@ def main():
     wallets = load_wallets()
 
     # Start WebSocket as primary data source (direct OKX DEX WS v6)
-    global _WS_CLIENT, _ws_sl_lock
-    _ws_sl_lock = threading.Lock()
+    global _WS_CLIENT
     try:
         _WS_CLIENT = OkxDexWs()
         _WS_CLIENT.start()

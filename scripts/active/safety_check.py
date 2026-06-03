@@ -59,7 +59,7 @@ MAX_IMPACT_PCT     = 15.0   # 价格影响超过15%拒绝
 MIN_LIQ_USD        = 1000   # 流动性低于$1k拒绝
 MIN_LIQ_FOR_FULL   = 50000  # 流动性超过$5k满分
 MAX_TOP10_HOLDER   = 80     # 前10持币超过80%拒绝
-MIN_SAFETY_SCORE   = 40     # 最低安全分（低于拒绝）
+MIN_SAFETY_SCORE   = 50     # 最低安全分（低于拒绝）
 RECOMMEND_SCORE    = 60     # 推荐分
 
 # ═══════════════════════════════════════════════════════════════
