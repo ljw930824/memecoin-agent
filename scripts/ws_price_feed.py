@@ -1,59 +1,66 @@
 """
-OKX WebSocket Module - Real-time price feed for monitor.
-Direct connection to OKX WS API, no OnChainOS CLI dependency.
-Supports: CEX prices (SOL, BNB, ETH, BTC), DEX smart money signals.
+OKX DEX WebSocket compatibility facade.
+
+The live project path uses the canonical DEX WebSocket V6 client in
+``scripts/active/okx_dex_ws.py``.  This module remains as a compatibility
+entry point for older launchers, but it no longer creates a separate CEX
+symbol feed.  DEX V6 price subscriptions require a chain index and token
+contract address; a CEX-style symbol such as ``SOL-USDT`` is therefore not a
+valid price key here.
 """
-import websocket
-import json
+
+import logging
+import os
+import sys
 import threading
 import time
-import os
-import logging
-import hmac
-import hashlib
-import base64
-from collections import defaultdict
-from datetime import datetime
+
 
 log = logging.getLogger("okx_ws")
 
-# ── Config ──────────────────────────────────────────────────────────────
-OKX_CEX_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
-OKX_DEX_WS_URL = "wss://wsdex.okx.com/ws/v6/dex"
-HEARTBEAT_INTERVAL = 25  # seconds (OKX requires ping every 30s)
-RECONNECT_DELAY = 5
-MAX_RECONNECTS = 10
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ACTIVE_DIR = os.path.join(_SCRIPT_DIR, "active")
+if _ACTIVE_DIR not in sys.path:
+    sys.path.insert(0, _ACTIVE_DIR)
 
-# ── Signal Store (thread-safe) ──────────────────────────────────────────
+from okx_dex_ws import (  # noqa: E402
+    SIGNAL_CHANNEL,
+    SMART_MONEY_ACTIVITY_CHANNEL,
+    OkxDexWs,
+)
+
+
+OKX_DEX_WS_URL = os.environ.get(
+    "OKX_DEX_WS_URL", "wss://wsdex.okx.com/ws/v6/dex"
+)
+
+
 class SignalStore:
-    """Thread-safe in-memory signal store for smart money data."""
+    """Thread-safe compatibility store for normalized DEX V6 entry events."""
+
     def __init__(self):
         self._lock = threading.Lock()
-        self._signals = []  # List of signal dicts
+        self._signals = []
         self._callbacks = []
-        self._last_signal_ts = 0
+        self._last_signal_ts = 0.0
 
     def add(self, signal: dict):
-        """Add a new signal."""
         with self._lock:
             self._signals.append(signal)
             self._last_signal_ts = time.time()
-            # Keep only last 1000 signals
             if len(self._signals) > 1000:
                 self._signals = self._signals[-1000:]
-        for cb in self._callbacks:
+        for callback in list(self._callbacks):
             try:
-                cb(signal)
-            except Exception as e:
-                log.warning(f"signal callback error: {e}")
+                callback(signal)
+            except Exception as exc:
+                log.warning("signal callback error: %s", exc)
 
     def get_recent(self, n=10):
-        """Get last n signals."""
         with self._lock:
             return self._signals[-n:]
 
     def get_all(self):
-        """Get all signals."""
         with self._lock:
             return list(self._signals)
 
@@ -61,35 +68,37 @@ class SignalStore:
         self._callbacks.append(callback)
 
     def last_signal_age(self):
-        """Return seconds since last signal."""
         with self._lock:
+            if not self._last_signal_ts:
+                return float("inf")
             return time.time() - self._last_signal_ts
 
-signal_store = SignalStore()
 
-# ── Price Store (thread-safe) ───────────────────────────────────────────
 class PriceStore:
-    """Thread-safe in-memory price store."""
+    """Thread-safe DEX V6 price store keyed by ``chainIndex:contract``."""
+
     def __init__(self):
         self._lock = threading.Lock()
-        self._prices = {}  # instId -> {px, ts, side}
+        self._prices = {}
         self._callbacks = []
 
-    def update(self, inst_id: str, px: float, side: str, ts: int):
+    def update(self, key: str, px: float, side: str = "", ts: int = 0):
         with self._lock:
-            self._prices[inst_id] = {
-                'px': px, 'side': side, 'ts': ts,
-                'updated': time.time()
+            self._prices[key] = {
+                "px": px,
+                "side": side,
+                "ts": ts,
+                "updated": time.time(),
             }
-        for cb in self._callbacks:
+        for callback in list(self._callbacks):
             try:
-                cb(inst_id, px, side, ts)
-            except Exception as e:
-                log.warning(f"callback error: {e}")
+                callback(key, px, side, ts)
+            except Exception as exc:
+                log.warning("price callback error: %s", exc)
 
-    def get(self, inst_id: str):
+    def get(self, key: str):
         with self._lock:
-            return self._prices.get(inst_id)
+            return self._prices.get(key)
 
     def get_all(self):
         with self._lock:
@@ -98,331 +107,198 @@ class PriceStore:
     def on_update(self, callback):
         self._callbacks.append(callback)
 
-    def age(self, inst_id: str):
-        """Return age in seconds since last update."""
+    def age(self, key: str):
         with self._lock:
-            entry = self._prices.get(inst_id)
+            entry = self._prices.get(key)
             if entry:
-                return time.time() - entry['updated']
-        return float('inf')
+                return time.time() - entry["updated"]
+        return float("inf")
 
+
+signal_store = SignalStore()
 price_store = PriceStore()
 
-# ── CEX WS Manager ──────────────────────────────────────────────────────
+
 class OKXCEXWebSocket:
-    """OKX CEX WebSocket for price data (SOL, BNB, ETH, BTC)."""
+    """Disabled compatibility shell for the removed CEX symbol feed."""
+
     def __init__(self, channels=None):
-        self.channels = channels or [
-            "SOL-USDT", "BNB-USDT", "ETH-USDT", "BTC-USDT"
-        ]
-        self.ws = None
-        self._thread = None
+        self.channels = channels or []
         self._running = False
-        self._reconnect_count = 0
-        self._last_heartbeat = 0
-
-    def _on_open(self, ws):
-        log.info("CEX WS connected")
-        self._reconnect_count = 0
-        for inst_id in self.channels:
-            sub = {
-                "op": "subscribe",
-                "args": [{"channel": "tickers", "instId": inst_id}]
-            }
-            ws.send(json.dumps(sub))
-            log.debug(f"Subscribed: {inst_id}")
-
-    def _on_message(self, ws, msg):
-        if not msg or msg == 'pong' or (msg and msg[0] not in '{['):
-            return
-        try:
-            data = json.loads(msg)
-        except json.JSONDecodeError:
-            return
-        if 'data' in data:
-            for item in data['data']:
-                inst = item.get('instId', '')
-                px = float(item.get('last', 0))
-                side = 'buy' if float(item.get('lastSz', 0)) > 0 else 'sell'
-                ts = int(item.get('ts', 0))
-                if px > 0:
-                    price_store.update(inst, px, side, ts)
-        elif data.get('event') == 'subscribe':
-            log.debug(f"Subscribed OK: {data.get('arg', {})}")
-        elif data.get('event') == 'error':
-            log.error(f"CEX WS error: {data}")
-
-    def _on_error(self, ws, err):
-        log.error(f"CEX WS error: {err}")
-
-    def _on_close(self, ws, code, reason):
-        log.warning(f"CEX WS closed: {code} - {reason}")
-        if self._running:
-            self._reconnect()
-
-    def _heartbeat(self):
-        while self._running:
-            time.sleep(1)
-            if self.ws and time.time() - self._last_heartbeat > HEARTBEAT_INTERVAL:
-                try:
-                    self.ws.send("ping")
-                    self._last_heartbeat = time.time()
-                except:
-                    pass
-
-    def _reconnect(self):
-        if self._reconnect_count >= MAX_RECONNECTS:
-            log.error(f"CEX Max reconnects ({MAX_RECONNECTS}) reached")
-            self._running = False
-            return
-        self._reconnect_count += 1
-        delay = RECONNECT_DELAY * self._reconnect_count
-        log.info(f"CEX Reconnecting in {delay}s (attempt {self._reconnect_count})")
-        time.sleep(delay)
-        self._connect()
-
-    def _connect(self):
-        self.ws = websocket.WebSocketApp(
-            OKX_CEX_WS_URL,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close
-        )
-        self.ws.run_forever()
 
     def start(self):
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._connect, daemon=True)
-        self._thread.start()
-        hb = threading.Thread(target=self._heartbeat, daemon=True)
-        hb.start()
-        log.info("CEX WS started")
+        log.warning(
+            "CEX symbol feed is disabled; use DEX V6 price subscriptions "
+            "with chainIndex and tokenContractAddress"
+        )
+        return False
 
     def stop(self):
         self._running = False
-        if self.ws:
-            self.ws.close()
 
-# ── DEX WS Manager (Smart Money Signals) ────────────────────────────────
+
 class OKXDEXWebSocket:
-    """OKX DEX WebSocket for smart money signals."""
+    """Compatibility adapter backed by the canonical DEX V6 client."""
+
     def __init__(self, api_key=None, secret=None, passphrase=None):
-        self.api_key = api_key or os.environ.get("OKX_API_KEY", "")
-        self.secret = secret or os.environ.get("OKX_SECRET_KEY", "")
-        self.passphrase = passphrase or os.environ.get("OKX_PASSPHRASE", "")
-        self.ws = None
-        self._thread = None
-        self._running = False
-        self._reconnect_count = 0
-        self._last_heartbeat = 0
-        self._logged_in = False
-        self._subscribed_channels = []
+        # Keep the old constructor surface, but let the canonical client read
+        # the same runtime credentials as the active monitor.
+        if api_key is not None:
+            os.environ["OKX_API_KEY"] = api_key
+        if secret is not None:
+            os.environ["OKX_SECRET_KEY"] = secret
+        if passphrase is not None:
+            os.environ["OKX_PASSPHRASE"] = passphrase
 
-    def _make_auth(self):
-        """Create OKX WS login message."""
-        ts = str(int(time.time()))
-        msg = ts + "GET" + "/users/self/verify"
-        mac = hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).digest()
-        sign = base64.b64encode(mac).decode()
-        return {
-            "op": "login",
-            "args": [{
-                "apiKey": self.api_key,
-                "passphrase": self.passphrase,
-                "timestamp": ts,
-                "sign": sign
-            }]
-        }
-
-    def _on_open(self, ws):
-        log.info("DEX WS connected")
-        self._reconnect_count = 0
-        self._logged_in = False
-        # Send auth
-        if self.api_key and self.secret:
-            auth = self._make_auth()
-            ws.send(json.dumps(auth))
-            log.debug("Sent DEX auth")
-        else:
-            log.error("DEX WS requires API key/secret")
-
-    def _on_message(self, ws, msg):
-        if not msg or msg == 'pong' or (msg and msg[0] not in '{['):
-            return
-        try:
-            data = json.loads(msg)
-        except json.JSONDecodeError:
-            return
-
-        event = data.get('event')
-        
-        if event == 'login':
-            self._logged_in = True
-            log.info("DEX WS logged in")
-            # Subscribe to smart money channels
-            self._subscribe_smart_money(ws)
-            
-        elif event == 'error':
-            log.error(f"DEX WS error: {data.get('code')} - {data.get('msg')}")
-            
-        elif event == 'subscribe':
-            log.debug(f"DEX subscribed: {data.get('arg', {})}")
-            
-        elif 'data' in data:
-            # Process smart money signal
-            channel = data.get('arg', {}).get('channel', '')
-            for item in data['data']:
-                signal = {
-                    'channel': channel,
-                    'ts': time.time(),
-                    'data': item
-                }
-                signal_store.add(signal)
-                # Also log key info
-                token = item.get('tokenSymbol', 'UNKNOWN')
-                chain = item.get('chainIndex', '?')
-                pnl = item.get('realizedPnlUsd', '0')
-                log.info(f"Signal: {token} (chain {chain}) PnL: ${pnl}")
-
-    def _subscribe_smart_money(self, ws):
-        """Subscribe to smart money channels."""
-        channels = [
-            {"channel": "kol_smartmoney-tracker-activity"},
-            {"channel": "dex-market-new-signal-openapi", "chainIndex": "501"},  # Solana
-            {"channel": "dex-market-new-signal-openapi", "chainIndex": "56"},   # BSC
-        ]
-        for ch in channels:
-            ws.send(json.dumps({"op": "subscribe", "args": [ch]}))
-            log.debug(f"Subscribing: {ch}")
-
-    def _on_error(self, ws, err):
-        log.error(f"DEX WS error: {err}")
-
-    def _on_close(self, ws, code, reason):
-        log.warning(f"DEX WS closed: {code} - {reason}")
-        self._logged_in = False
-        if self._running:
-            self._reconnect()
-
-    def _heartbeat(self):
-        while self._running:
-            time.sleep(1)
-            if self.ws and time.time() - self._last_heartbeat > HEARTBEAT_INTERVAL:
-                try:
-                    self.ws.send("ping")
-                    self._last_heartbeat = time.time()
-                except:
-                    pass
-
-    def _reconnect(self):
-        if self._reconnect_count >= MAX_RECONNECTS:
-            log.error(f"DEX Max reconnects ({MAX_RECONNECTS}) reached")
-            self._running = False
-            return
-        self._reconnect_count += 1
-        delay = RECONNECT_DELAY * self._reconnect_count
-        log.info(f"DEX Reconnecting in {delay}s (attempt {self._reconnect_count})")
-        time.sleep(delay)
-        self._connect()
-
-    def _connect(self):
-        self.ws = websocket.WebSocketApp(
-            OKX_DEX_WS_URL,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close
+        self._client = OkxDexWs(
+            channels=[SMART_MONEY_ACTIVITY_CHANNEL, SIGNAL_CHANNEL],
+            chain_indexes=["501", "56"],
         )
-        self.ws.run_forever()
+        self._pump_running = False
+        self._pump_thread = None
+
+    @property
+    def _running(self):
+        return self._client._running
+
+    @property
+    def ws(self):
+        return self._client._ws
+
+    def _pump_events(self):
+        while self._pump_running:
+            for event in self._client.get_events():
+                if event.get("event_type") == "price":
+                    price = event.get("tokenPrice")
+                    try:
+                        price = float(price)
+                    except (TypeError, ValueError):
+                        continue
+                    chain = event.get("chainIndex", "")
+                    contract = event.get("tokenContractAddress", "")
+                    if chain and contract:
+                        price_store.update(
+                            f"{chain}:{contract}",
+                            price,
+                            "",
+                            int(event.get("tradeTime") or 0),
+                        )
+                else:
+                    signal_store.add(event)
+            time.sleep(0.1)
 
     def start(self):
-        if self._running:
-            return
-        if not self.api_key or not self.secret:
-            log.error("DEX WS requires OKX_API_KEY and OKX_SECRET_KEY env vars")
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._connect, daemon=True)
-        self._thread.start()
-        hb = threading.Thread(target=self._heartbeat, daemon=True)
-        hb.start()
-        log.info("DEX WS started")
+        started = self._client.start()
+        if started and not self._pump_running:
+            self._pump_running = True
+            self._pump_thread = threading.Thread(
+                target=self._pump_events,
+                daemon=True,
+                name="okx-dex-v6-compat-pump",
+            )
+            self._pump_thread.start()
+        return started
 
     def stop(self):
-        self._running = False
-        if self.ws:
-            self.ws.close()
+        self._pump_running = False
+        self._client.stop()
+        if self._pump_thread and self._pump_thread.is_alive():
+            self._pump_thread.join(timeout=2)
 
     def is_logged_in(self):
-        return self._logged_in
+        return self._client.is_authenticated
 
-# ── Global instances ────────────────────────────────────────────────────
+    def sync_price_subscriptions(self, items):
+        return self._client.sync_price_subscriptions(items)
+
+    @property
+    def feed_status(self):
+        return self._client.feed_status
+
+    @property
+    def subscribed_channels(self):
+        return self._client.subscribed_channels
+
+
 cex_ws = OKXCEXWebSocket()
 dex_ws = OKXDEXWebSocket()
 
-def get_price(inst_id: str):
-    """Get latest CEX price. inst_id like 'SOL-USDT'."""
-    entry = price_store.get(inst_id)
-    return entry['px'] if entry else None
 
-def get_price_fresh(inst_id: str, max_age_sec=30):
-    """Get CEX price only if fresh (within max_age_sec)."""
-    if price_store.age(inst_id) < max_age_sec:
-        entry = price_store.get(inst_id)
-        return entry['px'] if entry else None
+def _price_key(chain_index_or_key: str, token_contract_address: str = ""):
+    if token_contract_address:
+        return f"{chain_index_or_key}:{token_contract_address}"
+    return chain_index_or_key
+
+
+def get_price(chain_index_or_key: str, token_contract_address: str = ""):
+    """Return a DEX V6 price using ``chainIndex`` and contract address."""
+    entry = price_store.get(_price_key(chain_index_or_key, token_contract_address))
+    return entry["px"] if entry else None
+
+
+def get_price_fresh(
+    chain_index_or_key: str,
+    token_contract_address: str = "",
+    max_age_sec=30,
+):
+    """Return a DEX V6 price only when it is fresh."""
+    # Accept the former ``get_price_fresh(key, max_age_sec)`` positional
+    # shape while keeping the V6 chain/address form as the canonical API.
+    if isinstance(token_contract_address, (int, float)) and max_age_sec == 30:
+        max_age_sec = token_contract_address
+        token_contract_address = ""
+    key = _price_key(chain_index_or_key, token_contract_address)
+    if price_store.age(key) < max_age_sec:
+        entry = price_store.get(key)
+        return entry["px"] if entry else None
     return None
 
+
 def get_recent_signals(n=10):
-    """Get recent smart money signals."""
     return signal_store.get_recent(n)
 
+
 def start_all():
-    """Start both CEX and DEX WebSockets."""
-    cex_ws.start()
-    dex_ws.start()
-    log.info("All WebSocket feeds started")
+    """Start the canonical DEX V6 signal and price client only."""
+    started = dex_ws.start()
+    log.info("DEX V6 WebSocket feed started=%s", started)
+    return started
+
 
 def stop_all():
-    cex_ws.stop()
     dex_ws.stop()
 
+
 def status():
-    """Return status of both WS connections."""
+    """Return compatibility status without exposing a legacy CEX feed."""
     return {
-        'cex': {
-            'running': cex_ws._running,
-            'prices': list(price_store.get_all().keys())
+        "cex": {
+            "running": False,
+            "enabled": False,
+            "prices": [],
         },
-        'dex': {
-            'running': dex_ws._running,
-            'logged_in': dex_ws.is_logged_in(),
-            'signals_count': len(signal_store.get_all()),
-            'last_signal_age': signal_store.last_signal_age()
-        }
+        "dex": {
+            "running": dex_ws._running,
+            "logged_in": dex_ws.is_logged_in(),
+            "feed_status": dex_ws.feed_status,
+            "subscribed_channels": dex_ws.subscribed_channels,
+            "signals_count": len(signal_store.get_all()),
+            "last_signal_age": signal_store.last_signal_age(),
+        },
     }
 
-# ── CLI test ────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(message)s')
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     start_all()
     try:
         while True:
             time.sleep(10)
-            print(f"\n--- Status ---")
-            s = status()
-            print(f"CEX: {s['cex']['running']} | Prices: {s['cex']['prices']}")
-            print(f"DEX: {s['dex']['running']} | Logged in: {s['dex']['logged_in']} | Signals: {s['dex']['signals_count']}")
-            
-            # Show recent signals
-            signals = get_recent_signals(3)
-            if signals:
-                print("Recent signals:")
-                for sig in signals:
-                    d = sig['data']
-                    print(f"  {d.get('tokenSymbol')} (chain {d.get('chainIndex')}): PnL ${d.get('realizedPnlUsd', 0)}")
+            current = status()
+            dex = current["dex"]
+            print(
+                f"DEX V6: {dex['running']} | logged in: {dex['logged_in']} "
+                f"| feed: {dex['feed_status']} | signals: {dex['signals_count']}"
+            )
     except KeyboardInterrupt:
         stop_all()
-        print("\nStopped.")

@@ -6,17 +6,33 @@ from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ACTIVE = os.path.join(ROOT, "scripts", "active")
+SCRIPTS = os.path.join(ROOT, "scripts")
 Dashboard = os.path.join(ROOT, "scripts", "dashboard")
 sys.path.insert(0, ACTIVE)
+sys.path.insert(0, SCRIPTS)
 sys.path.insert(0, Dashboard)
 
 import okx_dex_ws  # noqa: E402
+import ws_price_feed  # noqa: E402
 import qclaw_trading_common as common  # noqa: E402
 import realtime_sm_monitor as monitor  # noqa: E402
 import dashboard_server  # noqa: E402
 
 
 class ActivePipelineTests(unittest.TestCase):
+    def test_legacy_ws_facade_has_only_dex_v6_transport(self):
+        with open(os.path.join(SCRIPTS, "ws_price_feed.py"), encoding="utf-8") as handle:
+            source = handle.read().lower()
+        legacy_host = "wss://" + "ws." + "okx.com"
+        self.assertNotIn(legacy_host, source)
+        self.assertIn("wsdex.okx.com/ws/v6/dex", source)
+        self.assertFalse(ws_price_feed.cex_ws.start())
+        self.assertFalse(ws_price_feed.status()["cex"]["enabled"])
+
+    def test_legacy_ws_facade_uses_chain_and_contract_price_key(self):
+        ws_price_feed.price_store.update("501:TokenCA", 1.5, ts=1700000000000)
+        self.assertEqual(ws_price_feed.get_price("501", "TokenCA"), 1.5)
+
     def test_ws_normalizes_timestamp_and_common_aliases(self):
         event = okx_dex_ws._normalize_event({
             "chainId": 501,
