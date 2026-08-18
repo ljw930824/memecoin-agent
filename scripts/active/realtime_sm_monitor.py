@@ -17,7 +17,7 @@ OKX OnchainOS V6 REST signal/price API, with OnchainOS CLI fallback
 
 
 import sys
-import json, sys, os, subprocess, re, time
+import json, sys, os, subprocess, re, time, math
 import threading
 
 from datetime import datetime, timezone, timedelta
@@ -129,6 +129,7 @@ BSC_BAW_ENABLED = _env_flag('BSC_BAW_ENABLED', False)
 
 STATE_FILE = os.path.join(DATA, 'sm_monitor_state_dryrun.json' if DRY_RUN else 'sm_monitor_state.json')
 CMD_FILE = os.path.join(DATA, 'sm_commands.json')
+CONFIG_FILE = os.path.join(DATA, 'sm_runtime_config.json')
 
 
 LOG_FILE = os.path.join(DATA, 'sm_trade-log_dryrun.txt' if DRY_RUN else 'sm_trade-log.txt')
@@ -354,6 +355,161 @@ TIME_TIERS = (
     [(0, None, QUICK_TP_PCT, QUICK_TP_SELL_PCT, 'quick_tp')]
     if FAST_EXIT_MODE else LEGACY_TIME_TIERS
 )
+
+
+# Runtime-editable strategy controls.  Values are stored as ratios for
+# percentages (for example, 0.02 means 2%) and are validated before changing
+# the live process globals.
+RUNTIME_CONFIG_LIMITS = {
+    'min_mcap': (1000, 1_000_000_000),
+    'max_positions': (1, 50),
+    'min_consensus_wallets': (1, 100),
+    'min_wallet_winrate': (0.0, 1.0),
+    'buy_size_usdt': (0.10, 10_000.0),
+    'min_buy_size': (0.10, 10_000.0),
+    'max_buy_size': (0.10, 10_000.0),
+    'risk_pct': (0.001, 0.10),
+    'stop_loss_pct': (0.005, 0.50),
+    'daily_loss_limit_pct': (0.01, 1.0),
+    'monthly_loss_limit_pct': (0.01, 1.0),
+    'quick_tp_pct': (0.001, 10.0),
+    'quick_tp_sell_pct': (0.01, 1.0),
+    'max_hold_hours': (0.1, 720.0),
+    'poll_sec': (1.0, 300.0),
+}
+
+
+def runtime_config_snapshot():
+    """Return the effective controls in a JSON/dashboard-friendly shape."""
+    return {
+        'min_mcap': int(MIN_MCAP),
+        'max_positions': int(MAX_POSITIONS),
+        'min_consensus_wallets': int(MIN_CONSENSUS_WALLETS),
+        'min_wallet_winrate': float(MIN_WALLET_WINRATE),
+        'buy_size_usdt': float(BUY_SIZE_USDT),
+        'min_buy_size': float(MIN_BUY_SIZE),
+        'max_buy_size': float(MAX_BUY_SIZE),
+        'risk_pct': float(RISK_PCT),
+        'stop_loss_pct': abs(float(SL_PCT)),
+        'daily_loss_limit_pct': float(MAX_DAILY_LOSS_PCT),
+        'monthly_loss_limit_pct': float(MAX_MONTHLY_LOSS_PCT),
+        'quick_tp_pct': float(QUICK_TP_PCT),
+        'quick_tp_sell_pct': float(QUICK_TP_SELL_PCT),
+        'max_hold_hours': float(MAX_HOLD_HOURS),
+        'poll_sec': float(TRACKER_POLL_SEC),
+        'fast_exit_mode': bool(FAST_EXIT_MODE),
+        'bsc_baw_enabled': bool(BSC_BAW_ENABLED),
+    }
+
+
+def _runtime_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ('1', 'true', 'yes', 'on'):
+        return True
+    if isinstance(value, str) and value.strip().lower() in ('0', 'false', 'no', 'off'):
+        return False
+    raise ValueError('fast_exit_mode must be a boolean')
+
+
+def _normalize_runtime_updates(updates):
+    if not isinstance(updates, dict) or not updates:
+        raise ValueError('updates must be a non-empty object')
+    normalized = {}
+    for key, value in updates.items():
+        if key == 'fast_exit_mode':
+            normalized[key] = _runtime_bool(value)
+            continue
+        if key not in RUNTIME_CONFIG_LIMITS:
+            raise ValueError(f'unsupported config: {key}')
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'{key} must be numeric')
+        if not math.isfinite(number):
+            raise ValueError(f'{key} must be finite')
+        lower, upper = RUNTIME_CONFIG_LIMITS[key]
+        if number < lower or number > upper:
+            raise ValueError(f'{key} must be between {lower} and {upper}')
+        if key in ('min_mcap', 'max_positions', 'min_consensus_wallets'):
+            if not number.is_integer():
+                raise ValueError(f'{key} must be an integer')
+            normalized[key] = int(number)
+        else:
+            normalized[key] = number
+    return normalized
+
+
+def _write_runtime_config(snapshot):
+    os.makedirs(DATA, exist_ok=True)
+    editable = set(RUNTIME_CONFIG_LIMITS) | {'fast_exit_mode'}
+    payload = {
+        'updated_ts': time.time(),
+        'values': {key: snapshot[key] for key in editable if key in snapshot},
+    }
+    tmp_path = CONFIG_FILE + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CONFIG_FILE)
+
+
+def apply_runtime_config(updates, persist=True):
+    """Validate and apply dashboard controls without restarting the monitor."""
+    global MIN_MCAP, MAX_POSITIONS, MIN_CONSENSUS_WALLETS
+    global MIN_WALLET_WINRATE, BUY_SIZE_USDT, MIN_BUY_SIZE, MAX_BUY_SIZE
+    global RISK_PCT, BASE_RISK_PCT, SL_PCT_BASE, SL_PCT
+    global MAX_DAILY_LOSS_PCT, MAX_MONTHLY_LOSS_PCT, QUICK_TP_PCT
+    global QUICK_TP_SELL_PCT, MAX_HOLD_HOURS, TRACKER_POLL_SEC
+    global FAST_EXIT_MODE, TIME_TIERS
+
+    normalized = _normalize_runtime_updates(updates)
+    candidate = runtime_config_snapshot()
+    candidate.update(normalized)
+    if candidate['min_buy_size'] > candidate['max_buy_size']:
+        raise ValueError('min_buy_size cannot exceed max_buy_size')
+    if not candidate['min_buy_size'] <= candidate['buy_size_usdt'] <= candidate['max_buy_size']:
+        raise ValueError('buy_size_usdt must be between min_buy_size and max_buy_size')
+
+    MIN_MCAP = int(candidate['min_mcap'])
+    MAX_POSITIONS = int(candidate['max_positions'])
+    MIN_CONSENSUS_WALLETS = int(candidate['min_consensus_wallets'])
+    MIN_WALLET_WINRATE = float(candidate['min_wallet_winrate'])
+    BUY_SIZE_USDT = float(candidate['buy_size_usdt'])
+    MIN_BUY_SIZE = float(candidate['min_buy_size'])
+    MAX_BUY_SIZE = float(candidate['max_buy_size'])
+    RISK_PCT = float(candidate['risk_pct'])
+    BASE_RISK_PCT = RISK_PCT
+    SL_PCT_BASE = float(candidate['stop_loss_pct'])
+    SL_PCT = -SL_PCT_BASE
+    MAX_DAILY_LOSS_PCT = float(candidate['daily_loss_limit_pct'])
+    MAX_MONTHLY_LOSS_PCT = float(candidate['monthly_loss_limit_pct'])
+    QUICK_TP_PCT = float(candidate['quick_tp_pct'])
+    QUICK_TP_SELL_PCT = float(candidate['quick_tp_sell_pct'])
+    MAX_HOLD_HOURS = float(candidate['max_hold_hours'])
+    TRACKER_POLL_SEC = float(candidate['poll_sec'])
+    FAST_EXIT_MODE = bool(candidate['fast_exit_mode'])
+    TIME_TIERS = (
+        [(0, None, QUICK_TP_PCT, QUICK_TP_SELL_PCT, 'quick_tp')]
+        if FAST_EXIT_MODE else LEGACY_TIME_TIERS
+    )
+    snapshot = runtime_config_snapshot()
+    if persist:
+        _write_runtime_config(snapshot)
+    return snapshot
+
+
+def load_runtime_config():
+    """Load the last dashboard configuration, if one has been saved."""
+    if not os.path.exists(CONFIG_FILE):
+        return runtime_config_snapshot()
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+        values = payload.get('values', payload) if isinstance(payload, dict) else {}
+        return apply_runtime_config(values, persist=False)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        log(f'[CONFIG] ignored invalid runtime config: {exc}')
+        return runtime_config_snapshot()
 
 
 
@@ -634,6 +790,7 @@ def write_runtime_status(status, state=None, note=''):
         'rest_chain_indexes': rest_status.get('chain_indexes', []),
         'bsc_market_data_source': 'okx_v6_rest',
         'bsc_baw_enabled': BSC_BAW_ENABLED,
+        'config': runtime_config_snapshot(),
         'state_last_poll': (state or {}).get('last_poll', 0),
         'positions': len((state or {}).get('positions', {})),
     }
@@ -863,15 +1020,26 @@ def process_commands(state):
             except Exception as e:
                 log(f'[CMD] Reload failed: {e}')
 
+        elif action == 'set_config':
+            try:
+                snapshot = apply_runtime_config(cmd.get('updates', {}), persist=True)
+                log(f'[CMD] Runtime config applied: {", ".join(sorted(cmd.get("updates", {}).keys()))}')
+                log(f'[CONFIG] positions={snapshot["max_positions"]}, mcap=${snapshot["min_mcap"]:,}, risk={snapshot["risk_pct"]:.1%}, tp={snapshot["quick_tp_pct"]:.1%}, sl={snapshot["stop_loss_pct"]:.1%}')
+            except (TypeError, ValueError, OSError) as exc:
+                log(f'[CMD] Runtime config rejected: {exc}')
+
         elif action == 'set_risk':
-            # Override risk params at runtime
-            global RISK_PCT, MAX_DAILY_LOSS_PCT
+            # Backward-compatible adapter for the old command shape.
+            updates = {}
             if 'risk_pct' in cmd:
-                RISK_PCT = float(cmd['risk_pct'])
-                log(f'[CMD] RISK_PCT set to {RISK_PCT:.1%}')
+                updates['risk_pct'] = cmd['risk_pct']
             if 'daily_limit' in cmd:
-                MAX_DAILY_LOSS_PCT = float(cmd['daily_limit'])
-                log(f'[CMD] MAX_DAILY_LOSS_PCT set to {MAX_DAILY_LOSS_PCT:.1%}')
+                updates['daily_loss_limit_pct'] = cmd['daily_limit']
+            try:
+                apply_runtime_config(updates, persist=True)
+                log(f'[CMD] Legacy risk config applied: {", ".join(sorted(updates))}')
+            except (TypeError, ValueError, OSError) as exc:
+                log(f'[CMD] Legacy risk config rejected: {exc}')
 
         else:
             log(f'[CMD] Unknown action: {action}')
@@ -3393,6 +3561,7 @@ def main():
 
     mode = 'DRY-RUN' if DRY_RUN else 'LIVE'
 
+    load_runtime_config()
     write_runtime_status('starting')
 
     log(f'=== SM Monitor v3.3 [{mode}] ===')

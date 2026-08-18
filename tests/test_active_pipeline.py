@@ -110,6 +110,35 @@ class ActivePipelineTests(unittest.TestCase):
         finally:
             monitor.BSC_BAW_ENABLED = original
 
+    def test_runtime_config_applies_without_restart_and_rebuilds_exit_tiers(self):
+        original = monitor.runtime_config_snapshot()
+        editable = {key: value for key, value in original.items() if key != "bsc_baw_enabled"}
+        try:
+            with mock.patch.object(monitor, "_write_runtime_config"):
+                applied = monitor.apply_runtime_config({
+                    "max_positions": 5,
+                    "min_mcap": 50000,
+                    "risk_pct": 0.01,
+                    "stop_loss_pct": 0.06,
+                    "quick_tp_pct": 0.15,
+                    "quick_tp_sell_pct": 0.75,
+                })
+            self.assertEqual(monitor.MAX_POSITIONS, 5)
+            self.assertEqual(monitor.MIN_MCAP, 50000)
+            self.assertEqual(monitor.TIME_TIERS[0][2], 0.15)
+            self.assertEqual(monitor.TIME_TIERS[0][3], 0.75)
+            self.assertEqual(applied["stop_loss_pct"], 0.06)
+        finally:
+            monitor.apply_runtime_config(editable, persist=False)
+
+    def test_dashboard_config_validation_rejects_unsafe_values(self):
+        self.assertEqual(
+            dashboard_server.normalize_config_updates({"max_positions": 4, "risk_pct": 0.01}),
+            {"max_positions": 4, "risk_pct": 0.01},
+        )
+        with self.assertRaises(ValueError):
+            dashboard_server.normalize_config_updates({"max_positions": 0})
+
     def test_legacy_ws_facade_has_only_dex_v6_transport(self):
         with open(os.path.join(SCRIPTS, "ws_price_feed.py"), encoding="utf-8") as handle:
             source = handle.read().lower()

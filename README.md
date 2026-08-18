@@ -149,7 +149,7 @@ python scripts/active/realtime_sm_monitor.py --dry-run --once
 .\scripts\dashboard\start_simulation_dashboard.ps1
 ```
 
-浏览器打开 `http://127.0.0.1:8765/`。看板只读读取模拟盘状态、运行心跳和交易日志，每 2 秒刷新；不会提供下单控制。
+浏览器打开 `http://127.0.0.1:8765/`。看板读取模拟盘状态、运行心跳和交易日志，每 2 秒刷新；“运行配置”区域只允许提交经过边界校验的策略参数，不提供下单控制。
 
 ## 配置
 
@@ -168,6 +168,8 @@ MAX_HOLD_HOURS = 2
 
 `BSC_BAW_ENABLED=0`（默认）暂停 BAW；BSC 信号和价格仍由 OKX DEX V6 REST 提供。
 只有明确设置 `BSC_BAW_ENABLED=1`，才允许 BSC BAW 钱包余额、限价单和交易路径参与实盘流程。
+
+运行中的策略参数可以直接在 Dashboard 修改，配置会写入 `data/sm_runtime_config.json`，由模拟盘下一轮轮询读取，无需重启。
 
 ## 数据文件
 

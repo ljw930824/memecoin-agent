@@ -1,13 +1,15 @@
 """Read-only local dashboard server for the dry-run monitor.
 
 The API reads the monitor's JSON state, runtime heartbeat, and log file on
-each request. It does not write trading state and it binds to localhost by
-default.
+each request. Its configuration endpoint only queues validated local runtime
+configuration commands; it does not write trading positions or place orders.
+It binds to localhost by default.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -22,6 +24,86 @@ STATIC = Path(__file__).resolve().parent
 STATE_FILE = DATA / "sm_monitor_state_dryrun.json"
 RUNTIME_FILE = DATA / "dashboard_status.json"
 LOG_FILE = DATA / "sm_trade-log_dryrun.txt"
+CMD_FILE = DATA / "sm_commands.json"
+
+
+CONFIG_LIMITS = {
+    "min_mcap": (1000, 1_000_000_000),
+    "max_positions": (1, 50),
+    "min_consensus_wallets": (1, 100),
+    "min_wallet_winrate": (0.0, 1.0),
+    "buy_size_usdt": (0.10, 10_000.0),
+    "min_buy_size": (0.10, 10_000.0),
+    "max_buy_size": (0.10, 10_000.0),
+    "risk_pct": (0.001, 0.10),
+    "stop_loss_pct": (0.005, 0.50),
+    "daily_loss_limit_pct": (0.01, 1.0),
+    "monthly_loss_limit_pct": (0.01, 1.0),
+    "quick_tp_pct": (0.001, 10.0),
+    "quick_tp_sell_pct": (0.01, 1.0),
+    "max_hold_hours": (0.1, 720.0),
+    "poll_sec": (1.0, 300.0),
+}
+CONFIG_INTEGER_FIELDS = {"min_mcap", "max_positions", "min_consensus_wallets"}
+
+
+def normalize_config_updates(updates):
+    if not isinstance(updates, dict) or not updates:
+        raise ValueError("updates must be a non-empty object")
+    normalized = {}
+    for key, value in updates.items():
+        if key == "fast_exit_mode":
+            if not isinstance(value, bool):
+                raise ValueError("fast_exit_mode must be boolean")
+            normalized[key] = value
+            continue
+        if key not in CONFIG_LIMITS:
+            raise ValueError(f"unsupported config: {key}")
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be numeric")
+        if not math.isfinite(number):
+            raise ValueError(f"{key} must be finite")
+        lower, upper = CONFIG_LIMITS[key]
+        if number < lower or number > upper:
+            raise ValueError(f"{key} must be between {lower} and {upper}")
+        if key in CONFIG_INTEGER_FIELDS:
+            if not number.is_integer():
+                raise ValueError(f"{key} must be an integer")
+            normalized[key] = int(number)
+        else:
+            normalized[key] = number
+    if normalized.get("min_buy_size", 0) > normalized.get("max_buy_size", float("inf")):
+        raise ValueError("min_buy_size cannot exceed max_buy_size")
+    return normalized
+
+
+def queue_config_update(updates):
+    normalized = normalize_config_updates(updates)
+    current_runtime = read_json(RUNTIME_FILE, {})
+    current_config = current_runtime.get("config", {}) if isinstance(current_runtime, dict) else {}
+    candidate = dict(current_config) if isinstance(current_config, dict) else {}
+    candidate.update(normalized)
+    if candidate.get("min_buy_size", 0) > candidate.get("max_buy_size", float("inf")):
+        raise ValueError("min_buy_size cannot exceed max_buy_size")
+    if not candidate.get("min_buy_size", 0) <= candidate.get("buy_size_usdt", 0) <= candidate.get("max_buy_size", float("inf")):
+        raise ValueError("buy_size_usdt must be between min_buy_size and max_buy_size")
+    commands = read_json(CMD_FILE, [])
+    if not isinstance(commands, list):
+        commands = []
+    commands.append({
+        "action": "set_config",
+        "updates": normalized,
+        "source": "dashboard",
+        "queued_ts": time.time(),
+    })
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp_path = CMD_FILE.with_suffix(CMD_FILE.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(commands, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, CMD_FILE)
+    return normalized
 HK_TZ = timezone(timedelta(hours=8))
 
 
@@ -181,8 +263,9 @@ def build_status():
     state_age = max(0.0, now - last_poll) if last_poll else None
     risk_blocked = bool(state.get("risk_blocked"))
     risk_reason = state.get("risk_block_reason") or ("风险限制" if risk_blocked else "正常")
-    fast_exit = os.environ.get("FAST_EXIT_MODE", "1").lower() not in ("0", "false", "no")
-    quick_tp = to_float(os.environ.get("QUICK_TP_PCT", "0.10"), 0.10)
+    runtime_config = runtime.get("config") if isinstance(runtime.get("config"), dict) else {}
+    fast_exit = bool(runtime_config.get("fast_exit_mode", os.environ.get("FAST_EXIT_MODE", "1").lower() not in ("0", "false", "no")))
+    quick_tp = to_float(runtime_config.get("quick_tp_pct", os.environ.get("QUICK_TP_PCT", "0.10")), 0.10)
 
     log_lines = [line.rstrip("\r\n") for line in read_log_tail()]
     last_log = log_lines[-1] if log_lines else "暂无模拟盘日志"
@@ -243,11 +326,23 @@ def build_status():
         },
         "risk": {"blocked": risk_blocked, "reason": risk_reason},
         "config": {
-            "max_positions": 3,
-            "buy_size_usdt": 5,
+            "min_mcap": int(to_float(runtime_config.get("min_mcap"), 30000)),
+            "max_positions": int(to_float(runtime_config.get("max_positions"), 3)),
+            "min_consensus_wallets": int(to_float(runtime_config.get("min_consensus_wallets"), 1)),
+            "min_wallet_winrate": to_float(runtime_config.get("min_wallet_winrate"), 0.50),
+            "buy_size_usdt": to_float(runtime_config.get("buy_size_usdt"), 5),
+            "min_buy_size": to_float(runtime_config.get("min_buy_size"), 3),
+            "max_buy_size": to_float(runtime_config.get("max_buy_size"), 15),
+            "risk_pct": to_float(runtime_config.get("risk_pct"), 0.02),
+            "stop_loss_pct": to_float(runtime_config.get("stop_loss_pct"), 0.08),
+            "daily_loss_limit_pct": to_float(runtime_config.get("daily_loss_limit_pct"), 0.05),
+            "monthly_loss_limit_pct": to_float(runtime_config.get("monthly_loss_limit_pct"), 0.10),
             "quick_tp_pct": quick_tp,
+            "quick_tp_sell_pct": to_float(runtime_config.get("quick_tp_sell_pct"), 1.0),
             "fast_exit_mode": fast_exit,
-            "stop_loss_pct": -0.08,
+            "max_hold_hours": to_float(runtime_config.get("max_hold_hours"), 2),
+            "poll_sec": to_float(runtime_config.get("poll_sec"), 10),
+            "bsc_baw_enabled": bool(runtime_config.get("bsc_baw_enabled", runtime.get("bsc_baw_enabled"))),
         },
         "metrics": {
             "open_positions": len(positions),
@@ -297,12 +392,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self._send(404, "text/plain; charset=utf-8", "not found")
 
+    def do_POST(self):  # noqa: N802
+        path = urlparse(self.path).path
+        if path != "/api/config":
+            self._send(404, "text/plain; charset=utf-8", "not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 64 * 1024:
+                raise ValueError("request body is missing or too large")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            updates = payload.get("updates", payload) if isinstance(payload, dict) else None
+            normalized = queue_config_update(updates)
+            body = json.dumps({
+                "ok": True,
+                "queued": True,
+                "updates": normalized,
+                "message": "配置已提交，将在模拟盘下一轮轮询时生效",
+            }, ensure_ascii=False).encode("utf-8")
+            self._send(202, "application/json; charset=utf-8", body)
+        except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
+            body = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+            self._send(400, "application/json; charset=utf-8", body)
+
     def log_message(self, fmt, *args):
         return
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Local read-only dry-run dashboard")
+    parser = argparse.ArgumentParser(description="Local dry-run dashboard with validated runtime config")
     parser.add_argument("--host", default=os.environ.get("DASHBOARD_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("DASHBOARD_PORT", "8765")))
     args = parser.parse_args()
