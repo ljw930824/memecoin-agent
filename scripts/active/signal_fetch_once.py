@@ -18,10 +18,11 @@ from qclaw_trading_common import (
     okx_env_for_subprocess,
     canonical_chain_for_onchainos,
     locked_write_json,
+    workspace_root,
 )
 from okx_dex_ws import OkxDexWs  # optional WS data source
 
-DATA_DIR = os.path.join(os.path.expanduser('~'), '.qclaw', 'workspace', 'data')
+DATA_DIR = os.path.join(workspace_root(__file__), 'data')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
 LOG_FILE = os.path.join(DATA_DIR, 'signal-log.txt')
 os.makedirs(DATA_DIR, exist_ok=True)

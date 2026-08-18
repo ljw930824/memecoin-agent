@@ -7,27 +7,28 @@ baaw_dedup.py — BAW 去重层
 用法:
   from baw_dedup import is_token_bought, mark_token_bought, bought_tokens_list
 """
-import json, os, time
+import json, os, sys, time
 
-DEDUP_FILE = os.path.join(os.path.expanduser("~/.qclaw/workspace/data"), "baw-bought-tokens.json")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+from qclaw_trading_common import workspace_root, locked_read_json, locked_write_json
+
+DEDUP_FILE = os.path.join(workspace_root(__file__), "data", "baw-bought-tokens.json")
 _lock = None  # lightweight — rely on atomic writes
 
 
 def _load():
     if os.path.exists(DEDUP_FILE):
         try:
-            with open(DEDUP_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return locked_read_json(DEDUP_FILE, {})
         except Exception:
             pass
     return {}
 
 
 def _save(data):
-    tmp = DEDUP_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, DEDUP_FILE)
+    locked_write_json(DEDUP_FILE, data, indent=2)
 
 
 def is_token_bought(ca):

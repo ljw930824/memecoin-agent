@@ -22,14 +22,15 @@ from qclaw_trading_common import (  # noqa: E402
     locked_write_json,
     okx_env_for_subprocess,
     telegram_env,
+    workspace_root,
 )
 
-DATA_DIR = os.path.join(os.path.expanduser("~"), ".qclaw", "workspace", "data")
+DATA_DIR = os.path.join(workspace_root(__file__), "data")
 HEALTH_LOG = os.path.join(DATA_DIR, "api-health.log")
 ALERT_LOG = os.path.join(DATA_DIR, "api-alerts.log")
 HEALTH_STATE = os.path.join(DATA_DIR, "health-check-state.json")
 QUEUE_FILE = os.path.join(DATA_DIR, "signal-queue.json")
-STATE_FILE = os.path.join(DATA_DIR, "smart-money-state.json")
+STATE_FILE = os.path.join(DATA_DIR, "sm_monitor_state_dryrun.json")
 RECONCILE_LOG = os.path.join(DATA_DIR, "reconcile-hints.log")
 os.makedirs(DATA_DIR, exist_ok=True)
 

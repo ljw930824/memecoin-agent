@@ -21,9 +21,10 @@ from qclaw_trading_common import (  # noqa: E402
     okx_env_for_subprocess,
     signal_chain_is_solana,
     telegram_env,
+    workspace_root,
 )
 
-DATA_DIR   = os.path.expanduser('~/.qclaw/workspace/data')
+DATA_DIR   = os.path.join(workspace_root(__file__), 'data')
 STATE_FILE_BSC = os.path.join(DATA_DIR, 'smart-money-bsc-state.json')
 STATE_FILE_SOL = os.path.join(DATA_DIR, 'smart-money-sol-state.json')
 STATE_FILES = [STATE_FILE_BSC, STATE_FILE_SOL]  # monitor reads both separated state files

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Smart Money 模拟盘 Dashboard</title>
+  <style>
+    :root{--bg:#08111f;--panel:#101d30;--panel2:#14243a;--line:#263a55;--text:#e9f1fb;--muted:#8fa4bd;--green:#49d39b;--red:#ff6b7d;--amber:#f2bd62;--blue:#67a8ff;--shadow:0 16px 42px #0005}
+    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 10% 0,#18365a 0,#08111f 36%);color:var(--text);font:14px/1.5 Inter,Segoe UI,Microsoft YaHei,sans-serif}
+    .wrap{max-width:1440px;margin:0 auto;padding:28px 24px 44px}.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:22px}.eyebrow{color:var(--blue);font-size:12px;letter-spacing:.14em;text-transform:uppercase}.title{font-size:30px;font-weight:750;margin:4px 0}.subtitle{color:var(--muted)}.runtime{display:flex;align-items:center;gap:10px;background:#0d1a2b;border:1px solid var(--line);border-radius:14px;padding:12px 15px;box-shadow:var(--shadow);min-width:285px}.dot{width:10px;height:10px;border-radius:50%;background:var(--amber);box-shadow:0 0 12px currentColor}.dot.ok{background:var(--green)}.dot.bad{background:var(--red)}.runtime b{display:block}.runtime small{color:var(--muted)}
+    .notice{border:1px solid #665428;background:#2a2414;color:#f5d994;border-radius:12px;padding:11px 14px;margin-bottom:18px}.notice.good{border-color:#1f624f;background:#10271f;color:#a4efd0}.grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:18px}.card{background:linear-gradient(145deg,#122139,#0d192a);border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:var(--shadow);min-height:100px}.label{color:var(--muted);font-size:12px}.value{font-size:26px;font-weight:750;margin-top:8px;letter-spacing:-.02em}.value.green{color:var(--green)}.value.red{color:var(--red)}.value.amber{color:var(--amber)}.meta{color:var(--muted);font-size:12px;margin-top:5px}.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:18px;margin-bottom:18px}.panel{background:#0e1b2dce;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}.panel-head{display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid var(--line)}.panel-title{font-weight:700}.panel-sub{font-size:12px;color:var(--muted)}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 15px;border-bottom:1px solid #1d2e46;text-align:left;white-space:nowrap}th{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase}td{font-size:13px}.muted{color:var(--muted)}.pos-name{font-weight:650}.chain{font-size:11px;color:var(--muted);text-transform:uppercase}.pill{display:inline-flex;border-radius:99px;padding:3px 8px;font-size:11px;background:#1b3049;color:#b5c9e4}.pill.green{background:#123d34;color:#91e8c6}.pill.red{background:#492332;color:#ffabb7}.pill.amber{background:#473719;color:#f5d994}.empty{padding:32px;color:var(--muted);text-align:center}.logs{height:280px;overflow:auto;padding:13px 16px;background:#091321;font:12px/1.7 Consolas,monospace;color:#a9bbcf;white-space:pre-wrap}.foot{color:var(--muted);font-size:12px;margin-top:18px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}button{background:#193452;border:1px solid #2b4c72;color:#dbeaff;border-radius:8px;padding:7px 10px;cursor:pointer}button:hover{background:#245078}
+    @media(max-width:1100px){.grid{grid-template-columns:repeat(3,1fr)}.cols{grid-template-columns:1fr}.runtime{min-width:240px}}
+    @media(max-width:650px){.wrap{padding:18px 12px}.top{display:block}.runtime{margin-top:15px}.grid{grid-template-columns:repeat(2,1fr)}.value{font-size:22px}.panel-head{padding:13px}.title{font-size:24px}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="top">
+      <div><div class="eyebrow">Smart Money Execution Monitor</div><div class="title">模拟盘 Dashboard</div><div class="subtitle">WS 信号跟随 · 持仓实时价格 · 快速退出 · 只读监控</div></div>
+      <div class="runtime"><span id="runtimeDot" class="dot"></span><div><b id="runtimeStatus">读取中</b><small id="runtimeMeta">正在读取运行心跳…</small></div></div>
+    </section>
+    <div id="notice" class="notice">正在读取模拟盘状态…</div>
+    <section class="grid">
+      <div class="card"><div class="label">当前持仓</div><div id="openPositions" class="value">--</div><div class="meta">上限 <span id="maxPositions">--</span></div></div>
+      <div class="card"><div class="label">累计已实现 PnL</div><div id="closedPnl" class="value">--</div><div class="meta"><span id="closedTrades">--</span> 笔已关闭</div></div>
+      <div class="card"><div class="label">当前浮动 PnL</div><div id="openPnl" class="value">--</div><div class="meta">按持仓金额估算</div></div>
+      <div class="card"><div class="label">胜率</div><div id="winRate" class="value">--</div><div class="meta">按已关闭交易计算</div></div>
+      <div class="card"><div class="label">今日已实现 PnL</div><div id="todayPnl" class="value">--</div><div class="meta">香港时间自然日</div></div>
+      <div class="card"><div class="label">风控状态</div><div id="riskStatus" class="value">--</div><div id="riskMeta" class="meta">--</div></div>
+    </section>
+    <section class="cols">
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">当前持仓</div><div class="panel-sub">价格事件会直接更新这里的 PnL</div></div><span id="positionCount" class="pill">--</span></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>链</th><th>入场价</th><th>当前价</th><th>PnL</th><th>持有</th><th>跟卖</th></tr></thead><tbody id="positionsBody"></tbody></table></div></div>
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">运行与策略</div><div class="panel-sub">状态来源：本地心跳和状态文件</div></div><button id="refreshBtn">立即刷新</button></div><div style="padding:16px"><div class="meta">数据源</div><div id="feedStatus" class="value" style="font-size:20px">--</div><div class="meta" style="margin-top:16px">策略</div><div id="strategyStatus" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">最后轮询</div><div id="lastPoll" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">最近日志</div><div id="lastLog" style="margin-top:6px;color:#c4d4e6;word-break:break-word">--</div></div></div>
+    </section>
+    <section class="cols">
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">最近交易</div><div class="panel-sub">模拟盘历史，不代表实盘收益</div></div></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>Token</th><th>链</th><th>PnL</th><th>原因</th></tr></thead><tbody id="tradesBody"></tbody></table></div></div>
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">运行日志</div><div class="panel-sub">最近 80 行 · 每 2 秒刷新</div></div></div><div id="logs" class="logs">暂无日志</div></div>
+    </section>
+    <div class="foot"><span id="updatedAt">--</span><span>本地只读看板 · 不提供下单控制 · <a href="/" style="color:#83b7ff">刷新页面</a></span></div>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const money = value => { const n=Number(value); return Number.isFinite(n) ? `${n>=0?'+':''}$${n.toFixed(2)}` : '--'; };
+    const pct = value => { const n=Number(value); return Number.isFinite(n) ? `${n>=0?'+':''}${(n*100).toFixed(2)}%` : '--'; };
+    const tone = value => Number(value)>=0 ? 'green' : 'red';
+    function setValue(id, value, cls=''){ const el=$(id); el.textContent=value; el.className=`value ${cls}`; }
+    function emptyRow(cols, text){ return `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`; }
+    function render(data){
+      const m=data.metrics||{}, r=data.runtime||{}, cfg=data.config||{}, risk=data.risk||{};
+      const processText = r.process_status==='running' ? '模拟盘运行中' : (r.process_status==='starting' ? '模拟盘启动中' : (r.process_status==='stale' ? '模拟盘心跳过期' : '模拟盘未运行'));
+      $('runtimeStatus').textContent=processText;
+      $('runtimeMeta').textContent=`PID ${r.pid||'--'} · 心跳 ${r.heartbeat_age_sec==null?'--':r.heartbeat_age_sec+'s'}前`;
+      $('runtimeDot').className=`dot ${r.process_status==='running'?'ok':((r.process_status==='stopped'||r.process_status==='stale')?'bad':'')}`;
+      const notice=$('notice'); notice.className=`notice ${r.process_status==='running'?'good':''}`;
+      notice.textContent=r.process_status==='running' ? `${data.mode} 已启动 · ${data.feed.status} · 看板每 2 秒刷新` : (r.process_status==='stale' ? `${data.mode} 进程曾在运行，但心跳已 ${r.heartbeat_age_sec??'--'} 秒未更新，可能正在等待外部 CLI 返回` : `当前状态：${processText} · ${r.note||'等待启动'}`);
+      setValue('openPositions', `${m.open_positions??0}/${cfg.max_positions??'--'}`, m.open_positions>0?'green':'');
+      setValue('closedPnl', money(m.closed_pnl_usd), tone(m.closed_pnl_usd));
+      setValue('openPnl', money(m.open_pnl_usd), tone(m.open_pnl_usd));
+      setValue('winRate', m.win_rate==null?'--':`${(m.win_rate*100).toFixed(1)}%`, m.win_rate>=.5?'green':'');
+      setValue('todayPnl', money(m.today_pnl_usd), tone(m.today_pnl_usd));
+      setValue('riskStatus', risk.blocked?'BLOCKED':'正常', risk.blocked?'red':'green');
+      $('riskMeta').textContent=esc(risk.reason||'风险限制正常'); $('maxPositions').textContent=cfg.max_positions??'--'; $('closedTrades').textContent=m.closed_trades??0;
+      $('positionCount').textContent=`${m.open_positions??0} 个`;
+      $('feedStatus').textContent=data.feed?.status||'--'; $('feedStatus').style.color=data.feed?.class==='ok'?'var(--green)':(data.feed?.class==='bad'?'var(--red)':'var(--amber)');
+      $('strategyStatus').innerHTML=`${cfg.fast_exit_mode?'快速退出':'旧阶梯模式'} · 止盈 <b>${pct(cfg.quick_tp_pct)}</b> · 止损 <b>${pct(cfg.stop_loss_pct)}</b> · 单笔 $${cfg.buy_size_usdt}`;
+      $('lastPoll').textContent=`${r.state_last_poll?new Date(Number(r.state_last_poll)*1000).toLocaleString('zh-CN',{hour12:false}):'--'} · 状态延迟 ${m.state_age_sec==null?'--':m.state_age_sec+'s'}`;
+      $('lastLog').textContent=data.last_log||'暂无日志';
+      const pb=$('positionsBody'); pb.innerHTML=(data.positions||[]).length ? data.positions.map(p=>`<tr><td><div class="pos-name">${esc(p.symbol)}</div><div class="chain">${esc(p.token_ca).slice(0,18)}…</div></td><td>${esc(p.chain)}</td><td>${esc(p.entry_price)}</td><td>${esc(p.current_price)}</td><td class="${tone(p.pnl_pct)}">${pct(p.pnl_pct)}</td><td>${Number(p.hold_hours).toFixed(2)}h</td><td>${p.sm_sells}</td></tr>`).join('') : emptyRow(7,'当前无持仓');
+      const tb=$('tradesBody'); tb.innerHTML=(data.recent_trades||[]).length ? data.recent_trades.map(t=>`<tr><td>${esc(t.exit_time)}</td><td class="pos-name">${esc(t.symbol)}</td><td>${esc(t.chain)}</td><td class="${tone(t.pnl_pct)}">${pct(t.pnl_pct)} <span class="muted">(${money(t.pnl_usd)})</span></td><td><span class="pill ${Number(t.pnl_pct)>=0?'green':'red'}">${esc(t.reason)}</span></td></tr>`).join('') : emptyRow(5,'暂无已关闭交易');
+      $('logs').textContent=(data.logs||[]).join('\n')||'暂无日志'; $('logs').scrollTop=$('logs').scrollHeight; $('updatedAt').textContent=`看板更新时间：${new Date(data.generated_at).toLocaleString('zh-CN',{hour12:false})}`;
+    }
+    async function refresh(){ try{ const res=await fetch(`/api/status?t=${Date.now()}`,{cache:'no-store'}); if(!res.ok) throw new Error(res.status); render(await res.json()); }catch(e){ $('notice').className='notice'; $('notice').textContent=`看板读取失败：${e.message}`; $('runtimeStatus').textContent='数据读取失败'; $('runtimeDot').className='dot bad'; } }
+    $('refreshBtn').addEventListener('click',refresh); refresh(); setInterval(refresh,2000);
+  </script>
+</body>
+</html>

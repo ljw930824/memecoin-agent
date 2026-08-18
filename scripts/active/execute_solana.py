@@ -16,9 +16,10 @@ from qclaw_trading_common import (  # noqa: E402
     signal_chain_is_solana,
     telegram_env,
     dynamic_sl_tp_from_safety,
+    workspace_root,
 )
 
-DATA_DIR   = os.path.expanduser('~/.qclaw/workspace/data')
+DATA_DIR   = os.path.join(workspace_root(__file__), 'data')
 STATE_FILE = os.path.join(DATA_DIR, 'smart-money-sol-state.json')
 QUEUE_FILE = os.path.join(DATA_DIR, 'signal-queue.json')
 RETRY_LOG  = os.path.join(DATA_DIR, 'retry-log.txt')
@@ -825,6 +826,5 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
 
 

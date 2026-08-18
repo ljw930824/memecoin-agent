@@ -9,8 +9,8 @@ safety_check.py — 买入前安全检查模块（双链共享）
  4. 流动性深度        — 0~25（>50k 满分，<1k 拒绝）
  5. 持币集中度        — 0~15（top10 ≤50% 满分）
 
-安全阈值: score >= 40 才允许开仓
-推荐阈值: score >= 60 优先开仓
+安全阈值: score >= 70 才允许开仓
+推荐阈值: score >= 80 优先开仓
 """
 
 import json, subprocess, sys, time, os, re
@@ -59,8 +59,8 @@ MAX_IMPACT_PCT     = 15.0   # 价格影响超过15%拒绝
 MIN_LIQ_USD        = 1000   # 流动性低于$1k拒绝
 MIN_LIQ_FOR_FULL   = 50000  # 流动性超过$5k满分
 MAX_TOP10_HOLDER   = 80     # 前10持币超过80%拒绝
-MIN_SAFETY_SCORE   = 50     # 最低安全分（低于拒绝）
-RECOMMEND_SCORE    = 60     # 推荐分
+MIN_SAFETY_SCORE   = float(os.environ.get('MIN_SAFETY_SCORE', '70'))  # 默认提高门槛，过滤低质量 token
+RECOMMEND_SCORE    = 80     # 推荐分
 
 # ═══════════════════════════════════════════════════════════════
 # Solana: 通过 onchainos swap quote 获取审计数据

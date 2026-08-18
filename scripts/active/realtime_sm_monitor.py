@@ -41,14 +41,25 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _WS_CLIENT = None  # WebSocket primary data source (direct OKX DEX WS v6)
 _price_cache = {}  # {token_ca_lower: (price_float, timestamp)}
 _ws_sl_lock = None  # threading.Lock — WS instant SL thread safety (init in main)
+_ws_last_restart = 0  # throttle WS restart attempts
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from okx_dex_ws import OkxDexWs
 
 try:
-    from qclaw_trading_common import okx_env_for_subprocess  # noqa: E402
+    from qclaw_trading_common import (  # noqa: E402
+        okx_env_for_subprocess,
+        locked_read_json,
+        locked_write_json,
+        workspace_root,
+    )
 except ImportError:
     okx_env_for_subprocess = None  # type: ignore
+    locked_read_json = None  # type: ignore
+    locked_write_json = None  # type: ignore
+
+    def workspace_root(anchor_file=None):  # type: ignore
+        return os.path.abspath(os.path.join(os.path.dirname(anchor_file), "..", ".."))
 
 # Safety check module (honeypot/tax/liquidity pre-buy check)
 try:
@@ -59,7 +70,7 @@ except ImportError:
 
 # ===  ===
 
-BASE = os.path.join(os.path.expanduser('~'), '.qclaw', 'workspace')
+BASE = workspace_root(__file__)
 
 DATA = os.path.join(BASE, 'data')
 
@@ -90,13 +101,23 @@ def usdt_addr(chain):
 
 
 
-DRY_RUN = True  # sim test S1-S3
+# Parse command line arguments
+import sys as _sys_arg
+DRY_RUN = True  # default: dry-run
+if '--live' in _sys_arg.argv:
+    DRY_RUN = False
+    _sys_arg.argv.remove('--live')
+if '--dry-run' in _sys_arg.argv:
+    DRY_RUN = True
+    _sys_arg.argv.remove('--dry-run')
+del _sys_arg
 
 STATE_FILE = os.path.join(DATA, 'sm_monitor_state_dryrun.json' if DRY_RUN else 'sm_monitor_state.json')
 CMD_FILE = os.path.join(DATA, 'sm_commands.json')
 
 
 LOG_FILE = os.path.join(DATA, 'sm_trade-log_dryrun.txt' if DRY_RUN else 'sm_trade-log.txt')
+RUNTIME_FILE = os.path.join(DATA, 'sm_monitor_runtime_dryrun.json' if DRY_RUN else 'sm_monitor_runtime.json')
 
 WALLET_FILE = os.path.join(DATA, 'sm_wallets.json')
 
@@ -105,7 +126,7 @@ SHARED_DEDUP_TTL = 3600
 
 
 
-MIN_MCAP = 15000
+MIN_MCAP = 30000
 
 MIN_VOLUME = 500
 
@@ -143,21 +164,32 @@ SM_SELL_FOLLOW = 3
 CONSEC_SL_LIMIT = 3
 CONSEC_SL_FREEZE_SEC = 7200
 
-TRACKER_POLL_SEC = 10
+TRACKER_POLL_SEC = float(os.environ.get('SM_MONITOR_POLL_SEC', '10'))
 
 MIN_WALLET_WINRATE = 0.50
 
-MIN_CONSENSUS_WALLETS = 2
+MIN_CONSENSUS_WALLETS = 1
 
 WALLET_HISTORY_WINDOW = 3600
 
 DEAD_POSITION_USD = 0.50   # ?< $0.50
 
-MAX_PRICE_RETRIES = 3      # ?
+MAX_PRICE_RETRIES = int(os.environ.get('MAX_PRICE_RETRIES', '1'))
+PRICE_QUERY_TIMEOUT_SEC = float(os.environ.get('PRICE_QUERY_TIMEOUT_SEC', '5'))
+TRACKER_REST_TIMEOUT_SEC = float(os.environ.get('TRACKER_REST_TIMEOUT_SEC', '8'))
 
 POSITION_STALE_HOURS = 72  # ?2h
 
-MAX_HOLD_HOURS = 2  # Force sell after 2h max hold
+MAX_HOLD_HOURS = float(os.environ.get('MAX_HOLD_HOURS', '2'))
+
+# The intended strategy is fast follow-through: take the first defined profit
+# and leave.  The older multi-tier plan remains available with
+# FAST_EXIT_MODE=0 for controlled experiments/backtests.
+FAST_EXIT_MODE = os.environ.get('FAST_EXIT_MODE', '1').strip().lower() not in ('0', 'false', 'no')
+QUICK_TP_PCT = float(os.environ.get('QUICK_TP_PCT', '0.10'))
+QUICK_TP_SELL_PCT = float(os.environ.get('QUICK_TP_SELL_PCT', '1.0'))
+QUICK_TP_SELL_PCT = max(0.01, min(1.0, QUICK_TP_SELL_PCT))
+SOLD_RATIO_TIMEOUT_SEC = float(os.environ.get('SOLD_RATIO_TIMEOUT_SEC', '2.0'))
 
 
 
@@ -289,7 +321,7 @@ LADDER_RATIOS = [0.77, 0.50, 0.50]
 
 
 
-TIME_TIERS = [
+LEGACY_TIME_TIERS = [
 
     # (hold_hours, SL PnL, TP PnL, sell_pct, label)
     # v34: softer tiers - sell less early, let winners run
@@ -299,6 +331,11 @@ TIME_TIERS = [
     (24,  -0.03, 0.05,  1.00, '24h_exit'),    # 24h: SL -3%, TP +5% sell all
     (48,   0.00, None,  1.00, '48h_force'),    # 48h: force exit
 ]
+
+TIME_TIERS = (
+    [(0, None, QUICK_TP_PCT, QUICK_TP_SELL_PCT, 'quick_tp')]
+    if FAST_EXIT_MODE else LEGACY_TIME_TIERS
+)
 
 
 
@@ -523,6 +560,57 @@ def log(msg):
         pass
 
 
+def write_runtime_status(status, state=None, note=''):
+    """Publish a small read-only heartbeat for the local dashboard."""
+    ws_client = _WS_CLIENT
+    ready_attr = getattr(ws_client, 'is_ready', False) if ws_client else False
+    try:
+        ws_ready = ready_attr() if callable(ready_attr) else bool(ready_attr)
+    except Exception:
+        ws_ready = False
+    try:
+        ws_alive = bool(ws_client and ws_client.is_alive()) if ws_client else False
+    except Exception:
+        ws_alive = False
+    payload = {
+        'pid': os.getpid(),
+        'mode': 'DRY-RUN' if DRY_RUN else 'LIVE',
+        'dry_run': DRY_RUN,
+        'status': status,
+        'note': note,
+        'updated_ts': time.time(),
+        'updated_at': datetime.now(timezone(timedelta(hours=8))).isoformat(),
+        'ws_ready': ws_ready,
+        'ws_alive': ws_alive,
+        'state_last_poll': (state or {}).get('last_poll', 0),
+        'positions': len((state or {}).get('positions', {})),
+    }
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        if locked_write_json:
+            locked_write_json(RUNTIME_FILE, payload, indent=2)
+        else:
+            tmp = RUNTIME_FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, RUNTIME_FILE)
+    except Exception:
+        pass
+
+
+def start_runtime_heartbeat(state):
+    """Keep the dashboard heartbeat alive while a bounded CLI call runs."""
+    stop_event = threading.Event()
+
+    def _loop():
+        while not stop_event.wait(5):
+            write_runtime_status('running', state)
+
+    thread = threading.Thread(target=_loop, daemon=True, name='sm-monitor-heartbeat')
+    thread.start()
+    return stop_event, thread
+
+
 
 LOG_ROTATE_SIZE = 5 * 1024 * 1024  # 5MB
 
@@ -576,9 +664,12 @@ def parse_json(raw):
 def load_state():
 
     try:
-
+        if callable(locked_read_json):
+            return locked_read_json(
+                STATE_FILE,
+                {'seen_txs': [], 'positions': {}, 'last_ts': 0, 'wallet_stats': {}},
+            )
         with open(STATE_FILE, encoding='utf-8') as f:
-
             return json.load(f)
 
     except:
@@ -593,6 +684,8 @@ def load_state():
 def _load_shared_dedup():
     try:
         if os.path.exists(SHARED_DEDUP_FILE):
+            if callable(locked_read_json):
+                return locked_read_json(SHARED_DEDUP_FILE, {})
             with open(SHARED_DEDUP_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except:
@@ -602,6 +695,9 @@ def _load_shared_dedup():
 
 def _save_shared_dedup(data):
     try:
+        if callable(locked_write_json):
+            locked_write_json(SHARED_DEDUP_FILE, data, indent=2)
+            return
         with open(SHARED_DEDUP_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f)
     except:
@@ -730,7 +826,7 @@ def process_commands(state):
 
     state['positions'] = positions
 
-def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0.0):
+def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0.0, sold_pct=1.0):
     """Append closed position to trade_history."""
     entry_ts = int(pos.get('entry_ts', 0))
     now_ts = int(time.time())
@@ -741,18 +837,25 @@ def _save_trade_history(state, pos, exit_price, exit_pnl_pct, reason, exit_usd=0
     if abs(exit_pnl_pct) > 1.0:
         exit_pnl_pct = exit_pnl_pct / 100.0
     exit_usd_total = entry_usd * (1 + exit_pnl_pct) if entry_usd > 0 else exit_usd
+    # Fix: partial sells must prorate entry cost by sold_pct
+    sold_frac = max(0.0, min(1.0, float(sold_pct)))
+    if sold_frac <= 0:
+        sold_frac = 1.0  # safety fallback
+    prorated_entry = round(entry_usd * sold_frac, 6)
+    prorated_exit = round(exit_usd_total * sold_frac, 6) if exit_usd_total > 0 else round(exit_usd * sold_frac, 6)
     record = {
         'symbol': pos.get('symbol', '?'),
         'chain': pos.get('chain', 'solana'),
         'entry_ts': entry_ts,
         'entry_price': entry_price,
-        'entry_usd_amount': entry_usd,
+        'entry_usd_amount': prorated_entry,
+        'sold_pct': round(sold_frac, 4),
         'entry_mcap': pos.get('entry_mcap', 0),
         'buy_tx': pos.get('buy_tx', ''),
         'exit_ts': now_ts,
         'exit_price': exit_price,
         'exit_pnl_pct': round(exit_pnl_pct, 6),
-        'exit_usd': round(exit_usd_total, 4),
+        'exit_usd': prorated_exit,
         'hold_hours': hold_hours,
         'reason': reason,
     }
@@ -802,13 +905,14 @@ def save_state(state):
     state.setdefault('seen_txs', [])
     state['seen_txs'] = state['seen_txs'][-1000:]
 
+    if callable(locked_write_json):
+        locked_write_json(STATE_FILE, state, indent=2)
+        return
+
     tmp = STATE_FILE + '.tmp'
-
     with open(tmp, 'w', encoding='utf-8') as f:
-
         json.dump(state, f, indent=2, ensure_ascii=False)
-
-    os.replace(tmp, STATE_FILE)  #
+    os.replace(tmp, STATE_FILE)
 
 
 
@@ -1142,6 +1246,17 @@ def parse_baw_json(raw):
     return None
 
 
+def trade_time_ms(value):
+    """Normalize WS/REST timestamps to epoch milliseconds."""
+    try:
+        ts = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    if 0 < ts < 10_000_000_000:  # epoch seconds
+        ts *= 1000
+    return ts
+
+
 
 # ===  ===
 
@@ -1163,7 +1278,7 @@ def update_wallet_stats(wallets, trades):
 
         tt = int(t.get('tradeType', 0))
 
-        ts = int(t.get('tradeTime', '0') or '0')
+        ts = trade_time_ms(t.get('tradeTime', '0'))
 
         if w not in wallets:
 
@@ -1225,29 +1340,63 @@ def is_good_wallet(wallets, addr):
 
 # ===  ===
 
+def _ws_chain_index(chain):
+    """Map the monitor's chain names to OKX WS chain indexes."""
+    text = str(chain or "").strip().lower()
+    return {"solana": "501", "bsc": "56", "bnb": "56"}.get(text, text)
+
+
+def sync_ws_price_subscriptions(positions):
+    """Keep WS price feeds aligned with the currently held positions."""
+    if not _WS_CLIENT or not hasattr(_WS_CLIENT, 'sync_price_subscriptions'):
+        return
+    items = []
+    for position_key, pos in (positions or {}).items():
+        token_ca = str(pos.get('token_ca') or position_key or '').strip()
+        if not token_ca:
+            continue
+        items.append({
+            'chainIndex': _ws_chain_index(pos.get('chain', 'solana')),
+            'tokenContractAddress': token_ca,
+        })
+    try:
+        _WS_CLIENT.sync_price_subscriptions(items)
+    except Exception as exc:
+        log(f'WS price subscription sync failed: {exc}')
+
+
 def fetch_tracker(state=None):
 
     """Fetch recent smart money trades -- WS primary, REST fallback."""
 
     global _WS_CLIENT
 
-    # Try direct OKX DEX WS v6 first (primary data source)
-    if _WS_CLIENT and _WS_CLIENT.is_connected:
-        ws_trades = _WS_CLIENT.get_events()
-        if ws_trades:
+    # Drain WS first even if the socket closed after buffering an event.
+    if _WS_CLIENT:
+        ws_events = _WS_CLIENT.get_events()
+        if ws_events:
             # Update price cache from WS events (tokenPrice field)
             _now = time.time()
-            for _evt in ws_trades:
+            for _evt in ws_events:
                 try:
                     _ca = str(_evt.get('tokenContractAddress', '')).lower()
-                    _price = float(_evt.get('tokenPrice', 0))
+                    _price = float(_evt.get('tokenPrice', 0) or 0)
                     if _ca and _price > 0:
                         _price_cache[_ca] = (_price, _now)
                 except (ValueError, TypeError):
                     pass
-            # WS instant SL: check held positions against fresh WS prices
+            # WS instant SL/TP: executed by the main thread, never by the
+            # socket callback, so state and order paths remain serialized.
             _ws_instant_sl_check(state)
-            return ws_trades
+            # Price pushes drive exits but are not smart-money entry signals.
+            return [evt for evt in ws_events if evt.get('event_type') != 'price']
+
+        # A healthy WS is event-driven. Do not call REST while it is merely
+        # idle: that would block the main thread and defeat the wake-up path.
+        ws_ready_attr = getattr(_WS_CLIENT, 'is_ready', False)
+        ws_ready = ws_ready_attr() if callable(ws_ready_attr) else bool(ws_ready_attr)
+        if ws_ready:
+            return []
 
     # REST fallback (onchainos CLI) when WS is down or has no events
     all_trades = []
@@ -1264,7 +1413,7 @@ def fetch_tracker(state=None):
 
             '--min-volume', str(MIN_VOLUME)
 
-        ])
+        ], timeout=TRACKER_REST_TIMEOUT_SEC)
 
         d = parse_json(out)
 
@@ -1362,16 +1511,15 @@ def _ws_instant_sl_check(state):
                     to_sell.append((ca, 'trailing_stop', 1.0))
                     continue
 
-            # ── Quick TP (first tier only: +10% sell 30%) ──
-            if hold_hours < TIME_TIERS[0][0] or hold_hours >= TIME_TIERS[0][0]:
-                # TIME_TIERS[0] = (0, None, 0.10, 0.30, 'quick_tp')
-                if pnl >= TIME_TIERS[0][2]:  # 0.10 = +10%
-                    ladder_step = int(pos.get('ladder_step', 0))
-                    if ladder_step < 1:  # only first quick_tp tier
-                        log(f'[WS-TP] {sym} PnL={pnl:+.1%} >= +10% -> quick_tp 30%')
-                        to_sell.append((ca, 'quick_tp', 0.30))
-                        pos['ladder_step'] = 1
-                        continue
+            # ── Quick TP (first tier, full exit by default) ──
+            if pnl >= TIME_TIERS[0][2]:
+                ladder_step = int(pos.get('ladder_step', 0))
+                if ladder_step < 1:  # only first quick_tp tier
+                    quick_sell = TIME_TIERS[0][3]
+                    log(f'[WS-TP] {sym} PnL={pnl:+.1%} >= {TIME_TIERS[0][2]:+.0%} -> quick_tp {quick_sell:.0%}')
+                    to_sell.append((ca, 'quick_tp', quick_sell))
+                    pos['ladder_step'] = 1
+                    continue
 
         # ── Execute sells ──
         for ca, reason, sell_pct in to_sell:
@@ -1388,7 +1536,8 @@ def _ws_instant_sl_check(state):
             if sell_pct >= 1.0:
                 # Full sell
                 remaining = 1.0 - float(pos.get('sold_pct', 0))
-                token_bal = (BUY_SIZE_USDT * remaining) / entry_price if entry_price > 0 else 0
+                entry_usd = float(pos.get('entry_usd_amount', BUY_SIZE_USDT) or BUY_SIZE_USDT)
+                token_bal = (entry_usd * remaining) / entry_price if entry_price > 0 else 0
 
                 if DRY_RUN:
                     log(f'[DRY][WS] SELL ALL {sym} reason={reason} PnL={exit_pnl:+.1%}')
@@ -1402,13 +1551,14 @@ def _ws_instant_sl_check(state):
                         pos['sell_last_attempt'] = int(time.time())
                         continue  # skip removal, let check_positions retry
 
-                _save_trade_history(state, pos, current_price, exit_pnl, reason, sell_pct)
+                _save_trade_history(state, pos, current_price, exit_pnl, reason, sold_pct=1.0)
                 del positions[ca]
             else:
                 # Partial sell (quick_tp 30%)
                 remaining = 1.0 - float(pos.get('sold_pct', 0))
                 sell_amount = remaining * sell_pct
-                token_bal = (BUY_SIZE_USDT * remaining) / entry_price if entry_price > 0 else 0
+                entry_usd = float(pos.get('entry_usd_amount', BUY_SIZE_USDT) or BUY_SIZE_USDT)
+                token_bal = (entry_usd * remaining) / entry_price if entry_price > 0 else 0
                 sell_bal = token_bal * sell_pct
 
                 if DRY_RUN:
@@ -1421,7 +1571,7 @@ def _ws_instant_sl_check(state):
                         log(f'[WS] PARTIAL SELL FAIL {sym}')
                         continue
 
-                _save_trade_history(state, pos, current_price, exit_pnl, reason, sell_pct)
+                _save_trade_history(state, pos, current_price, exit_pnl, reason, sold_pct=sell_pct)
                 pos['sold_pct'] = float(pos.get('sold_pct', 0)) + sell_pct
 
         if to_sell:
@@ -1882,7 +2032,7 @@ def get_token_price_usd(chain, token_ca, retries=MAX_PRICE_RETRIES):
 
             '--chain', chain, '--address', token_ca
 
-        ], timeout=10)
+        ], timeout=PRICE_QUERY_TIMEOUT_SEC)
 
 
         d = parse_json(out)
@@ -2021,7 +2171,9 @@ def _check_sold_ratio(chain, ca):
     try:
         r = subprocess.run(
             ['onchainos', 'token', 'price-info', '--address', ca, '--chain', chain],
-            capture_output=True, timeout=8, encoding='utf-8', errors='replace'
+            capture_output=True, timeout=SOLD_RATIO_TIMEOUT_SEC,
+            encoding='utf-8', errors='replace',
+            env=okx_env_for_subprocess() if okx_env_for_subprocess else None,
         )
         if r.returncode == 0 and r.stdout.strip():
             data = json.loads(r.stdout.strip())
@@ -2099,15 +2251,15 @@ def process_new_trades(trades, state, wallets):
 
     seen = set(state.get('seen_txs', []))
 
-    wallets = update_wallet_stats(wallets, trades)
-
-
-
     new = [t for t in trades if t.get('txHash') and t['txHash'] not in seen]
 
     if not new:
 
         return positions
+
+    # Only learn from unseen events. REST fallback returns overlapping windows;
+    # updating before this filter would inflate wallet win rates on every poll.
+    wallets = update_wallet_stats(wallets, new)
 
 
 
@@ -2157,13 +2309,24 @@ def process_new_trades(trades, state, wallets):
 
     now = time.time()
     session_bought = set()  # P2: prevent same-token duplicate buy in single call
-    for ca, act in activity.items():
+    # Process the newest token activity first when a burst arrives.
+    activities = sorted(
+        activity.items(),
+        key=lambda item: trade_time_ms((item[1].get('latest') or {}).get('tradeTime')),
+        reverse=True,
+    )
+    for ca, act in activities:
 
         lat = act['latest']
 
         sym = lat.get('tokenSymbol', '?')
 
-        mcap = float(lat.get('marketCap') or 0)
+        mcap = float(
+            lat.get('marketCap')
+            or lat.get('marketCapUsd')
+            or lat.get('mcap')
+            or 0
+        )
 
         chain_idx = str(lat.get('chainIndex', ''))
 
@@ -2185,11 +2348,28 @@ def process_new_trades(trades, state, wallets):
                 new_s = positions[ca]['sm_sells'] - prev_sm
                 if new_s >= SM_SELL_FOLLOW:
                     positions[ca]['_prev_sm_sells'] = positions[ca]['sm_sells']
-                    bal = positions[ca].get('balance', 0)
+                    pos = positions[ca]
+                    bal = pos.get('balance', 0)
+                    entry_price = float(pos.get('entry_price', 0) or 0)
                     if bal > 0:
-                        execute_sell(chain, ca, round(bal, 6))
-                        log(f'SM FOLLOW IMMEDIATE: {sym}')
-                    del positions[ca]
+                        ok, tx = execute_sell(chain, ca, round(bal, 6))
+                        if ok:
+                            exit_price = float(pos.get('current_price', entry_price))
+                            exit_pnl = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+                            _save_trade_history(state, pos, exit_price, exit_pnl, 'sm_follow', exit_usd=0, sold_pct=1.0)
+                            log(f'SM FOLLOW IMMEDIATE: {sym} tx={tx[:20] if tx else ""}')
+                            del positions[ca]
+                            save_state(state)
+                        else:
+                            log(f'SM FOLLOW SELL FAIL: {sym}')
+                    else:
+                        # balance=0, clean dead position
+                        exit_price = float(pos.get('current_price', entry_price))
+                        exit_pnl = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+                        _save_trade_history(state, pos, exit_price, exit_pnl, 'sm_follow_dead', exit_usd=0, sold_pct=1.0)
+                        log(f'SM FOLLOW IMMEDIATE: {sym} (balance=0, cleaned)')
+                        del positions[ca]
+                        save_state(state)
 
             continue
 
@@ -2255,8 +2435,9 @@ def process_new_trades(trades, state, wallets):
 
 
             # Signal freshness: skip if SM signal > 60s old
-            sig_age = int(time.time() * 1000) - int(lat.get('tradeTime', 0))
-            if sig_age > 60000:
+            sig_ts = trade_time_ms(lat.get('tradeTime', 0))
+            sig_age = int(time.time() * 1000) - sig_ts if sig_ts else 999999999
+            if sig_age < 0 or sig_age > 60000:
                 log(f'SKIP {sym}: stale signal ({sig_age//1000}s old)')
                 continue
             # Concurrent sell filter: skip if SM is also selling this token
@@ -2275,7 +2456,14 @@ def process_new_trades(trades, state, wallets):
                         log(f'SKIP {sym}: soldRatio penalty')
                         continue
 
-            entry_price = get_token_price_usd(chain, ca)
+            # The WS event price is the fastest consistent entry reference;
+            # REST is only needed when the event did not include one.
+            try:
+                entry_price = float(lat.get('tokenPrice') or 0)
+            except (TypeError, ValueError):
+                entry_price = 0
+            if entry_price <= 0:
+                entry_price = get_token_price_usd(chain, ca)
 
             if not entry_price or entry_price <= 0:
 
@@ -2304,7 +2492,7 @@ def process_new_trades(trades, state, wallets):
             trend_tag = ''
             if trend_3m_entry != 0:
                 trend_tag = f' trend={trend_3m_entry:+.1%}/min'
-            log(f'SM BUY: {sym} (buyers={len(act["buy_wallets"])}/{good_buyers}good, mcap=${mcap:,.0f}{trend_tag})')
+            log(f'SM BUY: {sym} ({chain}) (buyers={len(act["buy_wallets"])}/{good_buyers}good, mcap=${mcap:,.0f}{trend_tag})')
 
             # risk control check
             can_trade, risk_reason = check_risk_limits(state)
@@ -2546,7 +2734,8 @@ def check_positions(positions, state=None):
 
         # ?=   (1 + pnl)
 
-        position_value = BUY_SIZE_USDT * (1.0 - float(pos.get('sold_pct', 0))) * (1 + pnl)
+        entry_usd = float(pos.get('entry_usd_amount', BUY_SIZE_USDT) or BUY_SIZE_USDT)
+        position_value = entry_usd * (1.0 - float(pos.get('sold_pct', 0))) * (1 + pnl)
 
         if position_value < DEAD_POSITION_USD and hold_hours > 1:
 
@@ -2752,7 +2941,8 @@ def check_positions(positions, state=None):
 
             remaining = 1.0 - float(pos.get('sold_pct', 0))
 
-            token_bal = (BUY_SIZE_USDT * remaining) / entry_price if entry_price > 0 else 0
+            entry_usd = float(pos.get('entry_usd_amount', BUY_SIZE_USDT) or BUY_SIZE_USDT)
+            token_bal = (entry_usd * remaining) / entry_price if entry_price > 0 else 0
 
         else:
 
@@ -2879,7 +3069,8 @@ def check_positions(positions, state=None):
 
             entry_price = float(pos.get('entry_price', 0) or 0)
 
-            token_remaining = (BUY_SIZE_USDT * remaining) / entry_price if entry_price > 0 else 0
+            entry_usd = float(pos.get('entry_usd_amount', BUY_SIZE_USDT) or BUY_SIZE_USDT)
+            token_remaining = (entry_usd * remaining) / entry_price if entry_price > 0 else 0
 
             sell_amount = token_remaining * ratio
 
@@ -2958,15 +3149,65 @@ def run_once(state, wallets):
     reload_positions_if_external_change(state)
     positions = state.get("positions", {})  # refresh after hot-reload
     process_commands(state)
+    # Clean up old buy_signals (older than 1 hour)
+    now_ts = int(time.time())
+    if 'buy_signals' in state:
+        state['buy_signals'] = [s for s in state['buy_signals'] if now_ts - s.get('ts', 0) < 3600]
+
+
     save_state(state)  # persist command results immediately (cmd file already cleared)
     positions = state.get("positions", {})  # refresh after commands
 
+    # WS health check: restart if dead (throttled to once per 60s)
+    global _WS_CLIENT, _ws_last_restart
+    if _WS_CLIENT is not None:
+        # Check if WS thread is alive (try is_alive() method, fallback to _thread.is_alive())
+        ws_alive = False
+        try:
+            if hasattr(_WS_CLIENT, 'is_alive') and callable(_WS_CLIENT.is_alive):
+                ws_alive = _WS_CLIENT.is_alive()
+            elif hasattr(_WS_CLIENT, '_thread') and _WS_CLIENT._thread:
+                ws_alive = _WS_CLIENT._thread.is_alive()
+        except Exception:
+            ws_alive = False
+        ws_ready = True
+        try:
+            ready_attr = getattr(_WS_CLIENT, 'is_ready', True)
+            ws_ready = ready_attr() if callable(ready_attr) else bool(ready_attr)
+        except Exception:
+            ws_ready = False
+        if not ws_alive or not ws_ready:
+            if time.time() - _ws_last_restart > 60:
+                log('WS client unavailable, restarting...')
+                try:
+                    _WS_CLIENT.stop()
+                except Exception:
+                    pass
+                try:
+                    _WS_CLIENT = OkxDexWs()
+                    started = _WS_CLIENT.start()
+                    if not started:
+                        log('WS unavailable, using REST fallback')
+                        _WS_CLIENT = None
+                    else:
+                        log('WS client restarted')
+                    _ws_last_restart = time.time()
+                except Exception as e:
+                    log(f'WS restart failed: {e}')
+                    _WS_CLIENT = None
+                    _ws_last_restart = time.time()
+            else:
+                log('WS client dead, restart throttled (wait 60s)')
+
+    # Existing positions must have a dedicated low-latency price feed before
+    # the event-driven tracker wait begins.
+    sync_ws_price_subscriptions(positions)
     trades = fetch_tracker(state)
 
     # Update held positions' current_price from WS price cache (immediate, no REST call)
     _now = time.time()
     for _pos_key, _pos in positions.items():
-        _pos_ca = _pos.get('token_ca', '').lower()
+        _pos_ca = (_pos.get('token_ca') or _pos_key or '').lower()
         _cached = _price_cache.get(_pos_ca)
         if _cached:
             _price, _ts = _cached
@@ -2983,7 +3224,14 @@ def run_once(state, wallets):
 
 
 
+    # A new position can be created by the signal just consumed. Subscribe
+    # before the next price event so the fast-exit path starts immediately.
+    sync_ws_price_subscriptions(positions)
     positions = check_positions(positions, state)
+
+    # Remove feeds for positions that were fully closed and retain feeds for
+    # positions that are still awaiting an exit.
+    sync_ws_price_subscriptions(positions)
 
     state['positions'] = positions
 
@@ -3043,6 +3291,8 @@ def main():
 
     mode = 'DRY-RUN' if DRY_RUN else 'LIVE'
 
+    write_runtime_status('starting')
+
     log(f'=== SM Monitor v3.3 [{mode}] ===')
     log(f'Risk: per-trade={RISK_PCT:.0%} of account, SL={SL_PCT_BASE:.0%}, daily_limit={MAX_DAILY_LOSS_PCT:.0%}, monthly_limit={MAX_MONTHLY_LOSS_PCT:.0%}')
     log(f'Position: min=${MIN_BUY_SIZE}, max=${MAX_BUY_SIZE}')
@@ -3064,15 +3314,27 @@ def main():
     _ws_sl_lock = threading.Lock()
     try:
         _WS_CLIENT = OkxDexWs()
-        _WS_CLIENT.start()
-        log('WS data source started')
+        if _WS_CLIENT.start():
+            log('WS data source started')
+            write_runtime_status('running', state, 'WS primary')
+        else:
+            log('WS unavailable, using REST fallback')
+            _WS_CLIENT = None
+            write_runtime_status('running', state, 'REST fallback')
     except Exception as e:
         log(f'WS start failed: {e}, using REST fallback')
+        write_runtime_status('running', state, 'REST fallback')
 
+
+    runtime_stop, runtime_thread = start_runtime_heartbeat(state)
 
     if ONCE:
 
         run_once(state, wallets)
+
+        runtime_stop.set()
+        runtime_thread.join(timeout=1)
+        write_runtime_status('stopped', state, 'once complete')
 
         return
 
@@ -3091,9 +3353,11 @@ def main():
 
             try:
                 run_once(state, wallets)
+                write_runtime_status('running', state)
             except Exception as e:
                 import traceback
                 log(f'ERROR in run_once: {e}')
+                write_runtime_status('error', state, str(e))
                 traceback.print_exc()
                 try:
                     save_state(state)
@@ -3108,14 +3372,20 @@ def main():
                 time.sleep(TRACKER_POLL_SEC * 3)
                 continue
 
-            log(f'--- sleep {TRACKER_POLL_SEC}s ---')
-
-
-            time.sleep(TRACKER_POLL_SEC)
+            log(f'--- wait up to {TRACKER_POLL_SEC}s (WS event wakes immediately) ---')
+            if _WS_CLIENT and hasattr(_WS_CLIENT, 'wait_for_events'):
+                _WS_CLIENT.wait_for_events(TRACKER_POLL_SEC)
+            else:
+                time.sleep(TRACKER_POLL_SEC)
 
     except KeyboardInterrupt:
 
         log('Stopped by user')
+
+        runtime_stop.set()
+        runtime_thread.join(timeout=1)
+
+        write_runtime_status('stopped', state, 'keyboard interrupt')
 
         if _WS_CLIENT:
             try:

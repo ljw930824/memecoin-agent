@@ -13,6 +13,22 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+
+def workspace_root(anchor_file: Optional[str] = None) -> str:
+    """Resolve the workspace without depending on the old OpenClaw install path.
+
+    ``QCLAW_WORKSPACE`` remains an explicit override for an installed deployment.
+    When scripts are run from this repository, the root is derived from the
+    location of ``scripts/active`` instead of ``~/.qclaw/workspace``.
+    """
+    override = os.environ.get("QCLAW_WORKSPACE", "").strip()
+    if override:
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(override)))
+    if anchor_file:
+        active_dir = os.path.dirname(os.path.abspath(anchor_file))
+        return os.path.abspath(os.path.join(active_dir, "..", ".."))
+    return os.path.abspath(os.getcwd())
+
 # Canonical chain field used by executors (matches CT_* / numeric Binance id)
 CHAIN_SLUG_TO_CANONICAL = {
     "solana": "CT_501",
