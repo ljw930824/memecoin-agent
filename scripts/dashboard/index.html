@@ -16,7 +16,7 @@
 <body>
   <main class="wrap">
     <section class="top">
-      <div><div class="eyebrow">Smart Money Execution Monitor</div><div class="title">模拟盘 Dashboard</div><div class="subtitle">WS 信号跟随 · 持仓实时价格 · 快速退出 · 只读监控</div></div>
+      <div><div class="eyebrow">Smart Money Execution Monitor</div><div class="title">模拟盘 Dashboard</div><div class="subtitle">OKX V6 REST 信号与价格 · BSC BAW 可暂停 · 快速退出 · 只读监控</div></div>
       <div class="runtime"><span id="runtimeDot" class="dot"></span><div><b id="runtimeStatus">读取中</b><small id="runtimeMeta">正在读取运行心跳…</small></div></div>
     </section>
     <div id="notice" class="notice">正在读取模拟盘状态…</div>
@@ -30,7 +30,7 @@
     </section>
     <section class="cols">
       <div class="panel"><div class="panel-head"><div><div class="panel-title">当前持仓</div><div class="panel-sub">价格事件会直接更新这里的 PnL</div></div><span id="positionCount" class="pill">--</span></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>链</th><th>入场价</th><th>当前价</th><th>PnL</th><th>持有</th><th>跟卖</th></tr></thead><tbody id="positionsBody"></tbody></table></div></div>
-      <div class="panel"><div class="panel-head"><div><div class="panel-title">运行与策略</div><div class="panel-sub">状态来源：本地心跳和状态文件</div></div><button id="refreshBtn">立即刷新</button></div><div style="padding:16px"><div class="meta">数据源</div><div id="feedStatus" class="value" style="font-size:20px">--</div><div class="meta" style="margin-top:16px">策略</div><div id="strategyStatus" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">最后轮询</div><div id="lastPoll" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">最近日志</div><div id="lastLog" style="margin-top:6px;color:#c4d4e6;word-break:break-word">--</div></div></div>
+      <div class="panel"><div class="panel-head"><div><div class="panel-title">运行与策略</div><div class="panel-sub">状态来源：本地心跳和状态文件</div></div><button id="refreshBtn">立即刷新</button></div><div style="padding:16px"><div class="meta">数据源</div><div id="feedStatus" class="value" style="font-size:20px">--</div><div class="meta" style="margin-top:16px">BSC 路由</div><div id="bscRoute" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">策略</div><div id="strategyStatus" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">最后轮询</div><div id="lastPoll" style="margin-top:6px">--</div><div class="meta" style="margin-top:16px">最近日志</div><div id="lastLog" style="margin-top:6px;color:#c4d4e6;word-break:break-word">--</div></div></div>
     </section>
     <section class="cols">
       <div class="panel"><div class="panel-head"><div><div class="panel-title">最近交易</div><div class="panel-sub">模拟盘历史，不代表实盘收益</div></div></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>Token</th><th>链</th><th>PnL</th><th>原因</th></tr></thead><tbody id="tradesBody"></tbody></table></div></div>
@@ -63,6 +63,7 @@
       $('riskMeta').textContent=esc(risk.reason||'风险限制正常'); $('maxPositions').textContent=cfg.max_positions??'--'; $('closedTrades').textContent=m.closed_trades??0;
       $('positionCount').textContent=`${m.open_positions??0} 个`;
       $('feedStatus').textContent=data.feed?.status||'--'; $('feedStatus').style.color=data.feed?.class==='ok'?'var(--green)':(data.feed?.class==='bad'?'var(--red)':'var(--amber)');
+      $('bscRoute').textContent=data.feed?.bsc_baw_enabled ? 'OKX V6 REST 市场数据 · BAW 执行器已启用' : 'OKX V6 REST 信号/价格 · BAW 已暂停'; $('bscRoute').style.color=data.feed?.bsc_baw_enabled?'var(--amber)':'var(--green)';
       $('strategyStatus').innerHTML=`${cfg.fast_exit_mode?'快速退出':'旧阶梯模式'} · 止盈 <b>${pct(cfg.quick_tp_pct)}</b> · 止损 <b>${pct(cfg.stop_loss_pct)}</b> · 单笔 $${cfg.buy_size_usdt}`;
       $('lastPoll').textContent=`${r.state_last_poll?new Date(Number(r.state_last_poll)*1000).toLocaleString('zh-CN',{hour12:false}):'--'} · 状态延迟 ${m.state_age_sec==null?'--':m.state_age_sec+'s'}`;
       $('lastLog').textContent=data.last_log||'暂无日志';

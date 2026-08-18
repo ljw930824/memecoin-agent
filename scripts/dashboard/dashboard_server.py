@@ -238,6 +238,8 @@ def build_status():
             "rest_last_price_count": runtime.get("rest_last_price_count", 0),
             "rest_request_count": runtime.get("rest_request_count", 0),
             "rest_chain_indexes": runtime.get("rest_chain_indexes") or [],
+            "bsc_market_data_source": runtime.get("bsc_market_data_source", ""),
+            "bsc_baw_enabled": bool(runtime.get("bsc_baw_enabled")),
         },
         "risk": {"blocked": risk_blocked, "reason": risk_reason},
         "config": {

@@ -98,6 +98,18 @@ class ActivePipelineTests(unittest.TestCase):
             monitor._WS_CLIENT = original_ws
             monitor.oc_run = original_oc_run
 
+    def test_bsc_baw_pause_blocks_cli_without_blocking_market_data_path(self):
+        original = monitor.BSC_BAW_ENABLED
+        try:
+            monitor.BSC_BAW_ENABLED = False
+            with mock.patch.object(monitor, "baw_run", side_effect=AssertionError("BAW must stay paused")):
+                self.assertEqual(monitor.get_balance_bsc(), {})
+                self.assertEqual(monitor.bsc_market_buy("0xToken", 3), (False, None))
+                positions = {"0xToken": {"chain": "bsc"}}
+                self.assertIs(monitor.check_bsc_limit_orders(positions), positions)
+        finally:
+            monitor.BSC_BAW_ENABLED = original
+
     def test_legacy_ws_facade_has_only_dex_v6_transport(self):
         with open(os.path.join(SCRIPTS, "ws_price_feed.py"), encoding="utf-8") as handle:
             source = handle.read().lower()

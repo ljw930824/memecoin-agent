@@ -4,25 +4,24 @@ Solana + BSC 链智能跟单系统 — 基于链上 Smart Money 信号的自动�
 
 ## 核心功能
 
-- **Smart Money 跟踪** — OKX DEX WebSocket 事件优先；仅在 WS 不可用时使用 REST tracker 兜底
-- **持仓实时价格** — 按持仓动态订阅 OKX `price` 频道，价格事件直接触发止盈/止损检查
+- **Smart Money 跟踪** — OKX DEX V6 REST `signal/list` 主链路，按链轮询最新信号
+- **持仓实时价格** — OKX DEX V6 REST `market/price` 批量查询；WS 仅保留兼容代码
 - **安全评分开仓** — 买入前 5 维评估（蜜罐/税率/冲击/流动性/持币集中度）
 - **快速退出** — 默认 +10% 全仓退出；旧阶梯模式可通过 `FAST_EXIT_MODE=0` 启用
 - **多维风控** — 止损 -8%、soldRatio 跟卖、最大持仓时间和连续止损冻结
-- **双链支持** — Solana (onchainos) + BSC (BAW CLI)
+- **双链支持** — Solana + BSC 市场数据统一走 OKX DEX V6 REST；BAW BSC 执行器默认暂停
 - **交易历史** — 完整记录每笔买入到卖出的 PnL、持有时间、出场原因
 
 ## 架构
 
 ```
-OKX DEX WebSocket smart-money activity（事件唤醒）
+OKX DEX V6 REST signal/list（501 Solana + 56 BSC）
     ↓
 realtime_sm_monitor.py ← 主循环
-    ├── REST tracker fallback（WS 不可用时）
-    ├── 持仓价格: OKX `price` channel（每个持仓动态订阅/取消）
+    ├── 持仓价格: OKX V6 REST market/price
     ├── 安全检查: safety_check.py (5 维评分, score≥70 开仓)
-    ├── 买入: onchainos buy / BAW CLI market-order swap
-    ├── 持仓监控: WS 实时价格 + soldRatio 过滤，REST 仅作兜底
+    ├── 买入/卖出: DRY-RUN 默认只记账；实盘执行需显式启用对应执行器
+    ├── BSC BAW: BSC_BAW_ENABLED=1 才启用，默认暂停
     ├── 卖出: 快速止盈 / 跟卖 / SL / 持仓超时
     └── 状态: data/sm_monitor_state*.json (持仓 + 交易历史)
 ```
@@ -87,7 +86,7 @@ realtime_sm_monitor.py ← 主循环
 |----------|------|------|
 | +10% | 全仓卖出 | 达到预期利润即退出 |
 
-设置 `FAST_EXIT_MODE=0` 后，才启用旧的多层时间/阶梯止盈逻辑。价格事件来自每个持仓的 OKX `price` 订阅；订阅连接中断时，主循环会降级到 REST 价格查询。
+设置 `FAST_EXIT_MODE=0` 后，才启用旧的多层时间/阶梯止盈逻辑。当前持仓价格统一通过 OKX DEX V6 REST `market/price` 查询。
 
 ### soldRatio 跟卖
 | soldRatio | 操作 |
@@ -121,7 +120,7 @@ realtime_sm_monitor.py ← 主循环
 - Python 3.7+
 - `requirements.txt` 中的 `websocket-client`
 - onchainos CLI（`~/.local/bin/onchainos.exe`）
-- BAW CLI（`baw` 命令）
+- BAW CLI（仅在 `BSC_BAW_ENABLED=1` 的 BSC 实盘执行场景需要）
 - Windows Task Scheduler
 
 ### 运行模拟盘主链
@@ -166,6 +165,9 @@ MAX_HOLD_HOURS = 2
 
 可选环境变量：`OKX_PRICE_CHANNEL=price`（低延迟价格）或
 `OKX_PRICE_CHANNEL=price-info`（同时获取市值、流动性等信息）。
+
+`BSC_BAW_ENABLED=0`（默认）暂停 BAW；BSC 信号和价格仍由 OKX DEX V6 REST 提供。
+只有明确设置 `BSC_BAW_ENABLED=1`，才允许 BSC BAW 钱包余额、限价单和交易路径参与实盘流程。
 
 ## 数据文件
 

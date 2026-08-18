@@ -114,6 +114,19 @@ if '--dry-run' in _sys_arg.argv:
     _sys_arg.argv.remove('--dry-run')
 del _sys_arg
 
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# BSC market data is already supplied by OKX DEX V6 REST.  Keep the legacy
+# BAW wallet/order integration paused unless explicitly enabled for a future
+# live-execution test.  DRY-RUN never needs BAW at all.
+BSC_BAW_ENABLED = _env_flag('BSC_BAW_ENABLED', False)
+
 STATE_FILE = os.path.join(DATA, 'sm_monitor_state_dryrun.json' if DRY_RUN else 'sm_monitor_state.json')
 CMD_FILE = os.path.join(DATA, 'sm_commands.json')
 
@@ -619,6 +632,8 @@ def write_runtime_status(status, state=None, note=''):
         'rest_request_count': rest_status.get('request_count', 0),
         'rest_last_request_ts': rest_status.get('last_request_ts', 0),
         'rest_chain_indexes': rest_status.get('chain_indexes', []),
+        'bsc_market_data_source': 'okx_v6_rest',
+        'bsc_baw_enabled': BSC_BAW_ENABLED,
         'state_last_poll': (state or {}).get('last_poll', 0),
         'positions': len((state or {}).get('positions', {})),
     }
@@ -1045,35 +1060,27 @@ def reconcile_wallet(state):
         log('reconcile: solana onchainos fail: ' + str(e))
 
 
-    # BSC
+    # BSC wallet/order reconciliation is paused with BAW.  BSC market data
+    # (signals and prices) continues through the direct OKX V6 REST client.
+    if BSC_BAW_ENABLED:
+        try:
+            bsc_out, bsc_code = baw_run(['wallet', 'balance', '--json'], timeout=10)
 
-    try:
+            if bsc_code == 0:
+                bd = parse_json(bsc_out)
 
-        r = subprocess.run([os.path.expanduser('~\\AppData\\Roaming\\QClaw\\npm-global\\baw.cmd') if sys.platform == 'win32' else 'baw', 'wallet', 'balance', '--json'], capture_output=True, timeout=10, encoding='utf-8', errors='replace')
+                if bd:
+                    items = bd if isinstance(bd, list) else bd.get('data', bd.get('tokens', []))
 
-        if r.returncode == 0:
+                    for item in items:
+                        addr = item.get('address') or item.get('contractAddress', '') or item.get('address', '')
+                        sym = item.get('symbol', '?')
+                        bal = float(item.get('balance', 0) or 0)
+                        if addr and addr != 'native' and bal > 0.01 and sym not in ('BNB', 'WBNB'):
+                            wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': 0, 'chain': 'bsc'}
 
-            bd = parse_json(r.stdout)
-
-            if bd:
-
-                items = bd if isinstance(bd, list) else bd.get('data', bd.get('tokens', []))
-
-                for item in items:
-
-                    addr = item.get('address') or item.get('contractAddress', '') or item.get('address', '')
-
-                    sym = item.get('symbol', '?')
-
-                    bal = float(item.get('balance', 0) or 0)
-
-                    if addr and addr != 'native' and bal > 0.01 and sym not in ('BNB', 'WBNB'):
-
-                        wallet_tokens[addr] = {'symbol': sym, 'balance': bal, 'price': 0, 'chain': 'bsc'}
-
-    except Exception as e:
-
-        log('reconcile: bsc fail: ' + str(e))
+        except Exception as e:
+            log('reconcile: bsc fail: ' + str(e))
 
     # Align
 
@@ -1081,33 +1088,23 @@ def reconcile_wallet(state):
 
     bsc_limit_orders = {}
 
-    try:
+    if BSC_BAW_ENABLED:
+        try:
+            lo_out, _ = baw_run(['limit-order', 'list', '--binanceChainId', '56', '--status', 'WORKING', '--json'], timeout=15)
 
-        lo_out, _ = baw_run(['limit-order', 'list', '--binanceChainId', '56', '--status', 'WORKING', '--json'], timeout=15)
+            lo_d = parse_baw_json(lo_out)
 
-        lo_d = parse_baw_json(lo_out)
-
-        if lo_d and lo_d.get('success'):
-
-            for order in lo_d.get('data', {}).get('list', []):
-
-                from_tok = order.get('fromToken', '').lower()
-
-                if from_tok:
-
-                    bsc_limit_orders[from_tok] = {
-
-                        'strategyId': order.get('strategyId', ''),
-
-                        'triggerPrice': order.get('triggerPrice', ''),
-
-                        'status': order.get('status', ''),
-
-                    }
-
-    except:
-
-        pass
+            if lo_d and lo_d.get('success'):
+                for order in lo_d.get('data', {}).get('list', []):
+                    from_tok = order.get('fromToken', '').lower()
+                    if from_tok:
+                        bsc_limit_orders[from_tok] = {
+                            'strategyId': order.get('strategyId', ''),
+                            'triggerPrice': order.get('triggerPrice', ''),
+                            'status': order.get('status', ''),
+                        }
+        except Exception:
+            pass
 
 
 
@@ -1171,6 +1168,12 @@ def reconcile_wallet(state):
             sym = pos.get('symbol', '?')
 
             chain = pos.get('chain', 'solana')
+
+            # Without BAW there is no BSC wallet snapshot to reconcile
+            # against.  Preserve BSC simulation/live state for the OKX price
+            # and signal path instead of treating it as an orphan.
+            if chain == 'bsc' and not BSC_BAW_ENABLED:
+                continue
 
             orphan_bal = pos.get('balance', 0)
 
@@ -1249,6 +1252,9 @@ def oc_run(cmd, timeout=20):
 def baw_run(args, timeout=30):
 
     """ BAW CLI ,?(stdout, returncode)"""
+
+    if not BSC_BAW_ENABLED:
+        return 'BAW integration paused (BSC_BAW_ENABLED=0)', -2
 
     try:
 
@@ -1642,6 +1648,9 @@ def get_balance_bsc():
 
     """BSC : ?baw wallet balance,?{contract_address: balance}"""
 
+    if not BSC_BAW_ENABLED:
+        return {}
+
     out, _ = baw_run(['wallet', 'balance', '--json'], timeout=15)
 
     d = parse_baw_json(out)
@@ -1671,6 +1680,10 @@ def get_balance_bsc():
 def bsc_market_buy(token_ca, amount_usdt):
 
     """BSC """
+
+    if not BSC_BAW_ENABLED:
+        log('BSC BUY blocked: BAW integration is paused')
+        return False, None
 
     out, _ = baw_run([
 
@@ -1712,6 +1725,10 @@ def bsc_market_sell(token_ca, token_balance):
 
     """BSC """
 
+    if not BSC_BAW_ENABLED:
+        log('BSC SELL blocked: BAW integration is paused')
+        return False, None
+
     out, _ = baw_run([
 
         'market-order', 'swap',
@@ -1751,6 +1768,9 @@ def bsc_market_sell(token_ca, token_balance):
 def place_tp_limit_order(token_ca, token_balance, entry_price, sym):
 
     """BSC  TP """
+
+    if not BSC_BAW_ENABLED:
+        return None
 
     tp_price = entry_price * (1 + TP_PCT)
 
@@ -1795,6 +1815,8 @@ def place_tp_limit_order(token_ca, token_balance, entry_price, sym):
 
 def place_sl_limit_order(token_ca, token_balance, entry_price, sym):
     """BSC SL"""
+    if not BSC_BAW_ENABLED:
+        return False, ''
     sl_price = entry_price * (1 + SL_PCT)
     out, _ = baw_run([
         'limit-order', 'sell',
@@ -1818,6 +1840,9 @@ def place_sl_limit_order(token_ca, token_balance, entry_price, sym):
 def cancel_limit_order(order_id, sym):
 
     """"""
+
+    if not BSC_BAW_ENABLED:
+        return False
 
     out, _ = baw_run([
 
@@ -1847,6 +1872,9 @@ def check_limit_order_status(order_id):
 
     """  status """
 
+    if not BSC_BAW_ENABLED:
+        return 'UNKNOWN'
+
     out, _ = baw_run([
 
         'limit-order', 'list',
@@ -1874,6 +1902,9 @@ def check_limit_order_status(order_id):
 def check_bsc_limit_orders(positions):
 
     """ BSC  -  + """
+
+    if not BSC_BAW_ENABLED:
+        return positions
 
     now_ts = int(time.time())
 
@@ -2568,8 +2599,9 @@ def process_new_trades(trades, state, wallets):
 
             dynamic_buy = calc_buy_size(state)
 
-            # Shared dedup: check if BAW already bought this token
-            if chain == 'bsc' and 'shared_is_bought' in dir():
+            # Shared dedup belongs to the optional BAW executor.  Do not let
+            # stale BAW records block the OKX REST-only BSC dry-run path.
+            if chain == 'bsc' and BSC_BAW_ENABLED and 'shared_is_bought' in dir():
                 if shared_is_bought(ca):
                     log(f'SKIP {sym}: already bought by BAW (shared dedup)')
                     continue
@@ -3366,6 +3398,7 @@ def main():
     log(f'=== SM Monitor v3.3 [{mode}] ===')
     log(f'Risk: per-trade={RISK_PCT:.0%} of account, SL={SL_PCT_BASE:.0%}, daily_limit={MAX_DAILY_LOSS_PCT:.0%}, monthly_limit={MAX_MONTHLY_LOSS_PCT:.0%}')
     log(f'Position: min=${MIN_BUY_SIZE}, max=${MAX_BUY_SIZE}')
+    log(f'BSC market data: OKX V6 REST; BAW executor: {"enabled" if BSC_BAW_ENABLED else "paused"}')
 
 
 
