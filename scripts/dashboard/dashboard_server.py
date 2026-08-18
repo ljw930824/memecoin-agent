@@ -45,11 +45,24 @@ CONFIG_LIMITS = {
     "poll_sec": (1.0, 300.0),
 }
 CONFIG_INTEGER_FIELDS = {"min_mcap", "max_positions", "min_consensus_wallets"}
+CHAIN_NAMES = ("solana", "bsc", "robinhood")
+CHAIN_CONFIG_KEYS = {
+    "min_mcap", "max_positions", "min_consensus_wallets", "min_wallet_winrate",
+    "buy_size_usdt", "min_buy_size", "max_buy_size", "risk_pct",
+    "stop_loss_pct", "quick_tp_pct", "quick_tp_sell_pct", "max_hold_hours",
+    "fast_exit_mode",
+}
+CHAIN_CONFIG_LIMITS = {
+    key: CONFIG_LIMITS[key]
+    for key in CHAIN_CONFIG_KEYS
+    if key in CONFIG_LIMITS
+}
 
 
-def normalize_config_updates(updates):
+def normalize_config_updates(updates, limits=None):
     if not isinstance(updates, dict) or not updates:
         raise ValueError("updates must be a non-empty object")
+    limits = limits or CONFIG_LIMITS
     normalized = {}
     for key, value in updates.items():
         if key == "fast_exit_mode":
@@ -57,7 +70,7 @@ def normalize_config_updates(updates):
                 raise ValueError("fast_exit_mode must be boolean")
             normalized[key] = value
             continue
-        if key not in CONFIG_LIMITS:
+        if key not in limits:
             raise ValueError(f"unsupported config: {key}")
         try:
             number = float(value)
@@ -65,7 +78,7 @@ def normalize_config_updates(updates):
             raise ValueError(f"{key} must be numeric")
         if not math.isfinite(number):
             raise ValueError(f"{key} must be finite")
-        lower, upper = CONFIG_LIMITS[key]
+        lower, upper = limits[key]
         if number < lower or number > upper:
             raise ValueError(f"{key} must be between {lower} and {upper}")
         if key in CONFIG_INTEGER_FIELDS:
@@ -79,10 +92,18 @@ def normalize_config_updates(updates):
     return normalized
 
 
-def queue_config_update(updates):
-    normalized = normalize_config_updates(updates)
+def queue_config_update(updates, chain=None):
+    chain = str(chain or "").strip().lower() or None
+    if chain and chain not in CHAIN_NAMES:
+        raise ValueError(f"unsupported chain: {chain}")
+    normalized = normalize_config_updates(updates, CHAIN_CONFIG_LIMITS if chain else CONFIG_LIMITS)
     current_runtime = read_json(RUNTIME_FILE, {})
-    current_config = current_runtime.get("config", {}) if isinstance(current_runtime, dict) else {}
+    runtime_config = current_runtime.get("config", {}) if isinstance(current_runtime, dict) else {}
+    current_config = (
+        runtime_config.get("chains", {}).get(chain, {})
+        if chain and isinstance(runtime_config.get("chains"), dict)
+        else runtime_config
+    )
     candidate = dict(current_config) if isinstance(current_config, dict) else {}
     candidate.update(normalized)
     if candidate.get("min_buy_size", 0) > candidate.get("max_buy_size", float("inf")):
@@ -95,6 +116,7 @@ def queue_config_update(updates):
     commands.append({
         "action": "set_config",
         "updates": normalized,
+        "chain": chain,
         "source": "dashboard",
         "queued_ts": time.time(),
     })
@@ -316,9 +338,12 @@ def build_status():
             "rest_last_signal_error": runtime.get("rest_last_signal_error", ""),
             "rest_last_signal_count": runtime.get("rest_last_signal_count", 0),
             "rest_last_signal_raw_count": runtime.get("rest_last_signal_raw_count", 0),
+            "rest_last_signal_counts_by_chain": runtime.get("rest_last_signal_counts_by_chain", {}),
+            "rest_last_signal_raw_counts_by_chain": runtime.get("rest_last_signal_raw_counts_by_chain", {}),
             "rest_last_price_ok": rest_price_ok,
             "rest_last_price_error": runtime.get("rest_last_price_error", ""),
             "rest_last_price_count": runtime.get("rest_last_price_count", 0),
+            "rest_last_price_counts_by_chain": runtime.get("rest_last_price_counts_by_chain", {}),
             "rest_request_count": runtime.get("rest_request_count", 0),
             "rest_chain_indexes": runtime.get("rest_chain_indexes") or [],
             "bsc_market_data_source": runtime.get("bsc_market_data_source", ""),
@@ -343,6 +368,7 @@ def build_status():
             "max_hold_hours": to_float(runtime_config.get("max_hold_hours"), 2),
             "poll_sec": to_float(runtime_config.get("poll_sec"), 10),
             "bsc_baw_enabled": bool(runtime_config.get("bsc_baw_enabled", runtime.get("bsc_baw_enabled"))),
+            "chains": runtime_config.get("chains", {}),
         },
         "metrics": {
             "open_positions": len(positions),
@@ -403,10 +429,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 raise ValueError("request body is missing or too large")
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
             updates = payload.get("updates", payload) if isinstance(payload, dict) else None
-            normalized = queue_config_update(updates)
+            chain = payload.get("chain") if isinstance(payload, dict) else None
+            normalized = queue_config_update(updates, chain=chain)
             body = json.dumps({
                 "ok": True,
                 "queued": True,
+                "chain": chain,
                 "updates": normalized,
                 "message": "配置已提交，将在模拟盘下一轮轮询时生效",
             }, ensure_ascii=False).encode("utf-8")

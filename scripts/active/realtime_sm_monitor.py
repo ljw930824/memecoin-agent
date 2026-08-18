@@ -98,8 +98,11 @@ _STATE_FILE_MTIME = 0
 
 
 def usdt_addr(chain):
-
-    return USDT_BSC if chain == 'bsc' else USDT_SOL
+    if chain == 'bsc':
+        return USDT_BSC
+    if chain == 'robinhood':
+        return ''
+    return USDT_SOL
 
 
 
@@ -378,6 +381,54 @@ RUNTIME_CONFIG_LIMITS = {
     'poll_sec': (1.0, 300.0),
 }
 
+CHAIN_NAMES = ('solana', 'bsc', 'robinhood')
+CHAIN_INDEXES = {'solana': '501', 'bsc': '56', 'robinhood': '4663'}
+CHAIN_LABELS = {'solana': 'Solana', 'bsc': 'BSC', 'robinhood': 'Robinhood'}
+REST_CHAIN_INDEXES = tuple(CHAIN_INDEXES.values())
+CHAIN_CONFIG_KEYS = {
+    'min_mcap', 'max_positions', 'min_consensus_wallets', 'min_wallet_winrate',
+    'buy_size_usdt', 'min_buy_size', 'max_buy_size', 'risk_pct',
+    'stop_loss_pct', 'quick_tp_pct', 'quick_tp_sell_pct', 'max_hold_hours',
+    'fast_exit_mode',
+}
+CHAIN_CONFIG_LIMITS = {
+    key: RUNTIME_CONFIG_LIMITS[key]
+    for key in CHAIN_CONFIG_KEYS
+    if key in RUNTIME_CONFIG_LIMITS
+}
+
+
+def _default_chain_config():
+    return {
+        'min_mcap': int(MIN_MCAP),
+        'max_positions': int(MAX_POSITIONS),
+        'min_consensus_wallets': int(MIN_CONSENSUS_WALLETS),
+        'min_wallet_winrate': float(MIN_WALLET_WINRATE),
+        'buy_size_usdt': float(BUY_SIZE_USDT),
+        'min_buy_size': float(MIN_BUY_SIZE),
+        'max_buy_size': float(MAX_BUY_SIZE),
+        'risk_pct': float(RISK_PCT),
+        'stop_loss_pct': abs(float(SL_PCT)),
+        'quick_tp_pct': float(QUICK_TP_PCT),
+        'quick_tp_sell_pct': float(QUICK_TP_SELL_PCT),
+        'max_hold_hours': float(MAX_HOLD_HOURS),
+        'fast_exit_mode': bool(FAST_EXIT_MODE),
+    }
+
+
+CHAIN_CONFIGS = {chain: _default_chain_config() for chain in CHAIN_NAMES}
+
+
+def get_chain_config(chain):
+    name = str(chain or '').strip().lower()
+    return CHAIN_CONFIGS.get(name, _default_chain_config())
+
+
+def _time_tiers_for_config(config):
+    if config.get('fast_exit_mode', FAST_EXIT_MODE):
+        return [(0, None, config['quick_tp_pct'], config['quick_tp_sell_pct'], 'quick_tp')]
+    return LEGACY_TIME_TIERS
+
 
 def runtime_config_snapshot():
     """Return the effective controls in a JSON/dashboard-friendly shape."""
@@ -399,6 +450,7 @@ def runtime_config_snapshot():
         'poll_sec': float(TRACKER_POLL_SEC),
         'fast_exit_mode': bool(FAST_EXIT_MODE),
         'bsc_baw_enabled': bool(BSC_BAW_ENABLED),
+        'chains': {chain: dict(get_chain_config(chain)) for chain in CHAIN_NAMES},
     }
 
 
@@ -412,15 +464,16 @@ def _runtime_bool(value):
     raise ValueError('fast_exit_mode must be a boolean')
 
 
-def _normalize_runtime_updates(updates):
+def _normalize_runtime_updates(updates, limits=None):
     if not isinstance(updates, dict) or not updates:
         raise ValueError('updates must be a non-empty object')
+    limits = limits or RUNTIME_CONFIG_LIMITS
     normalized = {}
     for key, value in updates.items():
         if key == 'fast_exit_mode':
             normalized[key] = _runtime_bool(value)
             continue
-        if key not in RUNTIME_CONFIG_LIMITS:
+        if key not in limits:
             raise ValueError(f'unsupported config: {key}')
         try:
             number = float(value)
@@ -428,7 +481,7 @@ def _normalize_runtime_updates(updates):
             raise ValueError(f'{key} must be numeric')
         if not math.isfinite(number):
             raise ValueError(f'{key} must be finite')
-        lower, upper = RUNTIME_CONFIG_LIMITS[key]
+        lower, upper = limits[key]
         if number < lower or number > upper:
             raise ValueError(f'{key} must be between {lower} and {upper}')
         if key in ('min_mcap', 'max_positions', 'min_consensus_wallets'):
@@ -446,6 +499,7 @@ def _write_runtime_config(snapshot):
     payload = {
         'updated_ts': time.time(),
         'values': {key: snapshot[key] for key in editable if key in snapshot},
+        'chains': snapshot.get('chains', {}),
     }
     tmp_path = CONFIG_FILE + '.tmp'
     with open(tmp_path, 'w', encoding='utf-8') as handle:
@@ -498,15 +552,45 @@ def apply_runtime_config(updates, persist=True):
     return snapshot
 
 
+def apply_chain_config(chain, updates, persist=True):
+    """Validate and apply one chain's entry/position/exit controls."""
+    name = str(chain or '').strip().lower()
+    if name not in CHAIN_NAMES:
+        raise ValueError(f'unsupported chain: {chain}')
+    normalized = _normalize_runtime_updates(updates, CHAIN_CONFIG_LIMITS)
+    candidate = dict(get_chain_config(name))
+    candidate.update(normalized)
+    if candidate['min_buy_size'] > candidate['max_buy_size']:
+        raise ValueError('min_buy_size cannot exceed max_buy_size')
+    if not candidate['min_buy_size'] <= candidate['buy_size_usdt'] <= candidate['max_buy_size']:
+        raise ValueError('buy_size_usdt must be between min_buy_size and max_buy_size')
+    CHAIN_CONFIGS[name] = candidate
+    if persist:
+        _write_runtime_config(runtime_config_snapshot())
+    return dict(candidate)
+
+
 def load_runtime_config():
     """Load the last dashboard configuration, if one has been saved."""
+    global CHAIN_CONFIGS
     if not os.path.exists(CONFIG_FILE):
+        CHAIN_CONFIGS = {chain: _default_chain_config() for chain in CHAIN_NAMES}
         return runtime_config_snapshot()
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as handle:
             payload = json.load(handle)
         values = payload.get('values', payload) if isinstance(payload, dict) else {}
-        return apply_runtime_config(values, persist=False)
+        apply_runtime_config(values, persist=False)
+        stored_chains = payload.get('chains', {}) if isinstance(payload, dict) else {}
+        CHAIN_CONFIGS = {chain: _default_chain_config() for chain in CHAIN_NAMES}
+        if isinstance(stored_chains, dict):
+            for chain, chain_values in stored_chains.items():
+                if chain in CHAIN_NAMES and isinstance(chain_values, dict):
+                    try:
+                        apply_chain_config(chain, chain_values, persist=False)
+                    except (TypeError, ValueError) as exc:
+                        log(f'[CONFIG] ignored invalid {chain} config: {exc}')
+        return runtime_config_snapshot()
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         log(f'[CONFIG] ignored invalid runtime config: {exc}')
         return runtime_config_snapshot()
@@ -515,7 +599,7 @@ def load_runtime_config():
 
 # ===  ===
 
-def get_effective_risk(state):
+def get_effective_risk(state, base_risk=None):
     """Dynamic risk: reduce when daily loss accumulates"""
     from datetime import datetime
     today_start = int(time.mktime(time.strptime(time.strftime('%Y-%m-%d'), '%Y-%m-%d')))
@@ -544,16 +628,19 @@ def get_effective_risk(state):
         usdt_total = 50.0
     account_total = max(usdt_total, 1.0)
     daily_pct = (realized_daily + unrealized_daily) / account_total
-    effective = BASE_RISK_PCT
+    base_risk = float(BASE_RISK_PCT if base_risk is None else base_risk)
+    effective = base_risk
     for threshold, reduced in RISK_TIERS:
         if daily_pct <= -threshold:
-            effective = reduced
-    if effective != BASE_RISK_PCT:
-        log(f'Dynamic risk: {BASE_RISK_PCT:.1%} -> {effective:.1%} (daily PnL {daily_pct:+.1%})')
+            reduction_ratio = reduced / BASE_RISK_PCT if BASE_RISK_PCT > 0 else 1.0
+            effective = min(effective, base_risk * reduction_ratio)
+    if effective != base_risk:
+        log(f'Dynamic risk: {base_risk:.1%} -> {effective:.1%} (daily PnL {daily_pct:+.1%})')
     return effective
 
-def calc_buy_size(state):
+def calc_buy_size(state, config=None):
     """动态仓位: risk_amount / |SL%| = (total x RISK_PCT) / SL_PCT_BASE"""
+    config = config or runtime_config_snapshot()
     try:
         # 获取账户总资产和 USDT 余额（从 onchainos totalValueUsd 取最可靠）
         sol_out, sol_code = oc_run(['onchainos', 'wallet', 'balance', '--chain', 'solana'], timeout=20)
@@ -597,23 +684,23 @@ def calc_buy_size(state):
                 elif ep > 0 and bal > 0:
                     account_total += p.get('entry_usd_amount', BUY_SIZE_USDT) * remaining * (1 + pnl)
         if account_total <= 0:
-            return BUY_SIZE_USDT  # fallback
+            return config['buy_size_usdt']  # fallback
 
-        effective_risk = get_effective_risk(state)
+        effective_risk = get_effective_risk(state, config['risk_pct'])
         risk_amount = account_total * effective_risk
-        size = risk_amount / SL_PCT_BASE
-        size = max(MIN_BUY_SIZE, min(MAX_BUY_SIZE, size))
+        size = risk_amount / config['stop_loss_pct']
+        size = max(config['min_buy_size'], min(config['max_buy_size'], size))
         # 不能超过可用 USDT 余额（留 5% gas buffer）
         affordable = usdt_total * 0.95 if usdt_total > 0 else 0
         if size > affordable and affordable >= 1.0:
             size = round(affordable, 2)
         elif size > affordable:
-            size = round(usdt_total, 2) if usdt_total > 0 else MIN_BUY_SIZE
+            size = round(usdt_total, 2) if usdt_total > 0 else config['min_buy_size']
         log(f'position_size: account=${account_total:.2f} -> buy=${size:.2f} (risk={effective_risk:.1%}, usdt=${usdt_total:.2f})')
         return round(size, 2)
     except Exception as e:
         log(f'calc_buy_size error: {e}')
-        return BUY_SIZE_USDT
+        return config['buy_size_usdt']
 
 def check_risk_limits(state):
     """检查日/月亏损限制, 返回 (can_trade: bool, reason: str)"""
@@ -782,9 +869,12 @@ def write_runtime_status(status, state=None, note=''):
         'rest_last_signal_error': rest_status.get('last_signal_error', ''),
         'rest_last_signal_count': rest_status.get('last_signal_count', 0),
         'rest_last_signal_raw_count': rest_status.get('last_signal_raw_count', 0),
+        'rest_last_signal_counts_by_chain': rest_status.get('last_signal_counts_by_chain', {}),
+        'rest_last_signal_raw_counts_by_chain': rest_status.get('last_signal_raw_counts_by_chain', {}),
         'rest_last_price_ok': rest_status.get('last_price_ok'),
         'rest_last_price_error': rest_status.get('last_price_error', ''),
         'rest_last_price_count': rest_status.get('last_price_count', 0),
+        'rest_last_price_counts_by_chain': rest_status.get('last_price_counts_by_chain', {}),
         'rest_request_count': rest_status.get('request_count', 0),
         'rest_last_request_ts': rest_status.get('last_request_ts', 0),
         'rest_chain_indexes': rest_status.get('chain_indexes', []),
@@ -1022,9 +1112,15 @@ def process_commands(state):
 
         elif action == 'set_config':
             try:
-                snapshot = apply_runtime_config(cmd.get('updates', {}), persist=True)
-                log(f'[CMD] Runtime config applied: {", ".join(sorted(cmd.get("updates", {}).keys()))}')
-                log(f'[CONFIG] positions={snapshot["max_positions"]}, mcap=${snapshot["min_mcap"]:,}, risk={snapshot["risk_pct"]:.1%}, tp={snapshot["quick_tp_pct"]:.1%}, sl={snapshot["stop_loss_pct"]:.1%}')
+                target_chain = cmd.get('chain')
+                if target_chain:
+                    snapshot = apply_chain_config(target_chain, cmd.get('updates', {}), persist=True)
+                    log(f'[CMD] {target_chain} config applied: {", ".join(sorted(cmd.get("updates", {}).keys()))}')
+                    log(f'[CONFIG] {target_chain} positions={snapshot["max_positions"]}, mcap=${snapshot["min_mcap"]:,}, risk={snapshot["risk_pct"]:.1%}, tp={snapshot["quick_tp_pct"]:.1%}, sl={snapshot["stop_loss_pct"]:.1%}')
+                else:
+                    snapshot = apply_runtime_config(cmd.get('updates', {}), persist=True)
+                    log(f'[CMD] Runtime config applied: {", ".join(sorted(cmd.get("updates", {}).keys()))}')
+                    log(f'[CONFIG] global positions={snapshot["max_positions"]}, mcap=${snapshot["min_mcap"]:,}, risk={snapshot["risk_pct"]:.1%}, tp={snapshot["quick_tp_pct"]:.1%}, sl={snapshot["stop_loss_pct"]:.1%}')
             except (TypeError, ValueError, OSError) as exc:
                 log(f'[CMD] Runtime config rejected: {exc}')
 
@@ -1286,8 +1382,9 @@ def reconcile_wallet(state):
 
         if ca not in positions and value_usd >= DEAD_POSITION_USD and info['symbol'] and info['symbol'] != '?' and ca not in BLACKLIST_TOKENS:
 
-            sl_price = info['price'] * (1 + SL_PCT)
-            pos_data = {'symbol': info['symbol'], 'chain': info['chain'], 'entry_ts': now_ts, 'entry_mcap': 0, 'entry_price': info['price'], 'entry_usd_amount': BUY_SIZE_USDT, 'last_update_ts': now_ts, 'sm_buys': 0, 'sm_sells': 0, 'buy_tx': 'recovered', 'sold_pct': 0.0, 'ladder_step': 0, 'current_price': info['price'], 'pnl_pct': 0.0, 'recovered': True, 'entry_price_est': True, 'sl': sl_price, 'sl_pct': SL_PCT}
+            chain_config = get_chain_config(info['chain'])
+            sl_price = info['price'] * (1 - chain_config['stop_loss_pct'])
+            pos_data = {'symbol': info['symbol'], 'chain': info['chain'], 'entry_ts': now_ts, 'entry_mcap': 0, 'entry_price': info['price'], 'entry_usd_amount': chain_config['buy_size_usdt'], 'last_update_ts': now_ts, 'sm_buys': 0, 'sm_sells': 0, 'buy_tx': 'recovered', 'sold_pct': 0.0, 'ladder_step': 0, 'current_price': info['price'], 'pnl_pct': 0.0, 'recovered': True, 'entry_price_est': True, 'sl': sl_price, 'sl_pct': -chain_config['stop_loss_pct']}
 
             if info['chain'] == 'bsc':
 
@@ -1340,7 +1437,7 @@ def reconcile_wallet(state):
             # Without BAW there is no BSC wallet snapshot to reconcile
             # against.  Preserve BSC simulation/live state for the OKX price
             # and signal path instead of treating it as an orphan.
-            if chain == 'bsc' and not BSC_BAW_ENABLED:
+            if chain == 'robinhood' or (chain == 'bsc' and not BSC_BAW_ENABLED):
                 continue
 
             orphan_bal = pos.get('balance', 0)
@@ -1537,7 +1634,7 @@ def get_wallet_winrate(wallets, addr):
 
 
 
-def is_good_wallet(wallets, addr):
+def is_good_wallet(wallets, addr, min_winrate=None):
 
     wr = get_wallet_winrate(wallets, addr)
 
@@ -1545,7 +1642,7 @@ def is_good_wallet(wallets, addr):
 
         return True
 
-    return wr >= MIN_WALLET_WINRATE
+    return wr >= (MIN_WALLET_WINRATE if min_winrate is None else min_winrate)
 
 
 
@@ -1554,7 +1651,11 @@ def is_good_wallet(wallets, addr):
 def _ws_chain_index(chain):
     """Map the monitor's chain names to OKX WS chain indexes."""
     text = str(chain or "").strip().lower()
-    return {"solana": "501", "bsc": "56", "bnb": "56"}.get(text, text)
+    return CHAIN_INDEXES.get(text, text)
+
+
+def _is_evm_chain(chain):
+    return _ws_chain_index(chain) in {'56', '4663'}
 
 
 def sync_ws_price_subscriptions(positions):
@@ -2164,6 +2265,11 @@ def get_balance(chain='solana'):
 
         return get_balance_bsc()
 
+    if chain == 'robinhood':
+        # No wallet/execution adapter is enabled for Robinhood yet.  Market
+        # data remains fully available through OKX V6 REST.
+        return {}
+
     # Solana - use OnChainOS wallet balance API (with Solana RPC fallback)
 
     result = {}
@@ -2282,7 +2388,7 @@ def get_token_price_usd(chain, token_ca, retries=MAX_PRICE_RETRIES):
             'chainIndex': _ws_chain_index(chain),
             'tokenContractAddress': token_ca,
         }])
-        _rest_key = f"{_ws_chain_index(chain)}:{token_ca.lower() if _ws_chain_index(chain) == '56' else token_ca}"
+        _rest_key = f"{_ws_chain_index(chain)}:{token_ca.lower() if _is_evm_chain(chain) else token_ca}"
         _rest_price = rest_prices.get(_rest_key)
         if _rest_price and _rest_price > 0:
             _price_cache[_ca] = (_rest_price, _now)
@@ -2368,6 +2474,10 @@ def execute_buy(chain, token_ca, amount_usdt):
 
         return True, 'dry-tx'
 
+    if chain == 'robinhood':
+        log('ROBINHOOD BUY blocked: market-data-only chain, no live executor')
+        return False, None
+
     if chain == 'bsc':
 
         return bsc_market_buy(token_ca, amount_usdt)
@@ -2433,6 +2543,8 @@ def execute_buy(chain, token_ca, amount_usdt):
 
 def _check_sold_ratio(chain, ca):
     """Check soldRatio from onchainos API."""
+    if chain == 'robinhood':
+        return None
     try:
         r = subprocess.run(
             ['onchainos', 'token', 'price-info', '--address', ca, '--chain', chain],
@@ -2457,6 +2569,10 @@ def execute_sell(chain, token_ca, token_balance):
         log(f'[DRY] SELL {token_balance} {token_ca[:12]}...')
 
         return True, 'dry-tx'
+
+    if chain == 'robinhood':
+        log('ROBINHOOD SELL blocked: market-data-only chain, no live executor')
+        return False, None
 
     if chain == 'bsc':
 
@@ -2595,9 +2711,10 @@ def process_new_trades(trades, state, wallets):
 
         chain_idx = str(lat.get('chainIndex', ''))
 
-        chain_map = {'501': 'solana', '56': 'bsc'}
+        chain_map = {'501': 'solana', '56': 'bsc', '4663': 'robinhood'}
 
         chain = chain_map.get(chain_idx, 'unknown')
+        chain_config = get_chain_config(chain) if chain != 'unknown' else {}
 
 
 
@@ -2661,15 +2778,19 @@ def process_new_trades(trades, state, wallets):
 
         if act['buys'] > 0:
 
-            if mcap < MIN_MCAP:
+            if mcap < chain_config['min_mcap']:
 
-                log(f'SKIP {sym}: mcap=${mcap:,.0f} < ${MIN_MCAP:,}')
+                log(f'SKIP {sym}: mcap=${mcap:,.0f} < ${chain_config["min_mcap"]:,} ({chain})')
 
                 continue
 
-            if len(positions) >= MAX_POSITIONS:
+            chain_position_count = sum(
+                1 for position in positions.values()
+                if position.get('chain') == chain
+            )
+            if chain_position_count >= chain_config['max_positions']:
 
-                log(f'SKIP {sym}: max positions ({MAX_POSITIONS})')
+                log(f'SKIP {sym}: {chain} max positions ({chain_config["max_positions"]})')
 
                 continue
 
@@ -2679,7 +2800,10 @@ def process_new_trades(trades, state, wallets):
 
                 continue
 
-            good_wallets = [w for w in act['buy_wallets'] if is_good_wallet(wallets, w)]
+            good_wallets = [
+                w for w in act['buy_wallets']
+                if is_good_wallet(wallets, w, chain_config['min_wallet_winrate'])
+            ]
 
             if not good_wallets and act['buy_wallets']:
 
@@ -2691,9 +2815,9 @@ def process_new_trades(trades, state, wallets):
 
             good_buyers = len(good_wallets)
 
-            if good_buyers < MIN_CONSENSUS_WALLETS:
+            if good_buyers < chain_config['min_consensus_wallets']:
 
-                log(f'SKIP {sym}: consensus fail (good={good_buyers}, need>={MIN_CONSENSUS_WALLETS})')
+                log(f'SKIP {sym}: consensus fail (good={good_buyers}, need>={chain_config["min_consensus_wallets"]})')
 
                 continue
 
@@ -2717,7 +2841,7 @@ def process_new_trades(trades, state, wallets):
                     continue
                 elif sr >= 0.30:
                     log(f'WARN {sym}: soldRatio={sr:.0%} (penalty)')
-                    if good_buyers < MIN_CONSENSUS_WALLETS + 1:
+                    if good_buyers < chain_config['min_consensus_wallets'] + 1:
                         log(f'SKIP {sym}: soldRatio penalty')
                         continue
 
@@ -2765,7 +2889,7 @@ def process_new_trades(trades, state, wallets):
                 log(f'SKIP {sym}: risk blocked ({risk_reason})')
                 continue
 
-            dynamic_buy = calc_buy_size(state)
+            dynamic_buy = calc_buy_size(state, chain_config)
 
             # Shared dedup belongs to the optional BAW executor.  Do not let
             # stale BAW records block the OKX REST-only BSC dry-run path.
@@ -2939,6 +3063,8 @@ def check_positions(positions, state=None):
     for ca, pos in list(positions.items()):
 
         chain = pos.get('chain', 'solana')
+        chain_config = get_chain_config(chain)
+        chain_time_tiers = _time_tiers_for_config(chain_config)
 
         sym = pos.get('symbol', '?')
 
@@ -3014,8 +3140,8 @@ def check_positions(positions, state=None):
         # ?
 
         # Max hold time check (force sell after N hours)
-        if hold_hours > MAX_HOLD_HOURS:
-            log(f'MAX HOLD: {sym} {hold_hours:.1f}h > {MAX_HOLD_HOURS}h -> force sell')
+        if hold_hours > chain_config['max_hold_hours']:
+            log(f'MAX HOLD: {sym} {hold_hours:.1f}h > {chain_config["max_hold_hours"]}h -> force sell')
             to_sell_all.append((ca, 'max_hold_time'))
             continue
 
@@ -3034,7 +3160,7 @@ def check_positions(positions, state=None):
 
         #
 
-        dynamic_sl = SL_PCT
+        dynamic_sl = -chain_config['stop_loss_pct']
 
         triggered = False
 
@@ -3046,7 +3172,7 @@ def check_positions(positions, state=None):
 
         if not is_recovered:
 
-            for tier_hours, tier_sl, tier_tp, sell_pct, label in TIME_TIERS:
+            for tier_hours, tier_sl, tier_tp, sell_pct, label in chain_time_tiers:
 
                 if hold_hours < tier_hours:
 
@@ -3115,7 +3241,7 @@ def check_positions(positions, state=None):
 
 
 
-        effective_sl = (dynamic_sl if dynamic_sl is not None else SL_PCT) + trend_adj  # double guard
+        effective_sl = (dynamic_sl if dynamic_sl is not None else -chain_config['stop_loss_pct']) + trend_adj  # double guard
 
         # Trailing stop: lock profits
 
@@ -3147,7 +3273,7 @@ def check_positions(positions, state=None):
 
         if pnl <= effective_sl:
 
-            sl_label = f'({effective_sl:.0%})' if effective_sl != SL_PCT else ''
+            sl_label = f'({effective_sl:.0%})' if effective_sl != -chain_config['stop_loss_pct'] else ''
 
             trend_info = f' trend3m={trend_3m:.1%}/min 15m={trend_15m:.1%}/min'
 
@@ -3568,6 +3694,7 @@ def main():
     log(f'Risk: per-trade={RISK_PCT:.0%} of account, SL={SL_PCT_BASE:.0%}, daily_limit={MAX_DAILY_LOSS_PCT:.0%}, monthly_limit={MAX_MONTHLY_LOSS_PCT:.0%}')
     log(f'Position: min=${MIN_BUY_SIZE}, max=${MAX_BUY_SIZE}')
     log(f'BSC market data: OKX V6 REST; BAW executor: {"enabled" if BSC_BAW_ENABLED else "paused"}')
+    log(f'OKX REST chains: {", ".join(f"{CHAIN_LABELS[name]}({CHAIN_INDEXES[name]})" for name in CHAIN_NAMES)}')
 
 
 
@@ -3587,7 +3714,7 @@ def main():
     _ws_sl_lock = threading.Lock()
     _WS_CLIENT = None
     try:
-        _REST_CLIENT = OkxDexRest(chain_indexes=('501', '56'))
+        _REST_CLIENT = OkxDexRest(chain_indexes=REST_CHAIN_INDEXES)
         if _REST_CLIENT.enabled:
             log('OKX V6 REST signal/price source started')
             write_runtime_status('running', state, 'OKX V6 REST primary')

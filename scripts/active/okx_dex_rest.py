@@ -28,6 +28,7 @@ REST_BASE_URL = os.environ.get("OKX_DEX_REST_BASE_URL", "https://web3.okx.com")
 SIGNAL_PATH = "/api/v6/dex/market/signal/list"
 PRICE_PATH = "/api/v6/dex/market/price"
 REST_TIMEOUT_SEC = float(os.environ.get("OKX_REST_TIMEOUT_SEC", "10"))
+EVM_CHAIN_INDEXES = {"56", "4663"}
 
 
 class OkxDexRestError(RuntimeError):
@@ -61,7 +62,9 @@ def _epoch_ms(value: Any) -> str:
 
 def _chain_index(chain: Any) -> str:
     text = str(chain or "").strip().lower()
-    return {"solana": "501", "bsc": "56", "bnb": "56"}.get(text, str(chain or ""))
+    return {"solana": "501", "bsc": "56", "bnb": "56", "robinhood": "4663"}.get(
+        text, str(chain or "")
+    )
 
 
 def _wallets(value: Any) -> List[str]:
@@ -136,9 +139,12 @@ class OkxDexRest:
         self.last_signal_error = ""
         self.last_signal_count = 0
         self.last_signal_raw_count = 0
+        self.last_signal_counts_by_chain: Dict[str, int] = {}
+        self.last_signal_raw_counts_by_chain: Dict[str, int] = {}
         self.last_price_ok: Optional[bool] = None
         self.last_price_error = ""
         self.last_price_count = 0
+        self.last_price_counts_by_chain: Dict[str, int] = {}
         self.request_count = 0
         self.last_request_ts = 0.0
 
@@ -203,6 +209,7 @@ class OkxDexRest:
     def fetch_signal_events(self) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
         raw_count = 0
+        raw_counts_by_chain: Dict[str, int] = {}
         max_age_ms = int(float(os.environ.get("OKX_REST_SIGNAL_MAX_AGE_SEC", "60")) * 1000)
         now_ms = int(time.time() * 1000)
         try:
@@ -222,6 +229,7 @@ class OkxDexRest:
                 if not isinstance(items, list):
                     items = []
                 raw_count += len(items)
+                raw_counts_by_chain[chain] = len(items)
                 for item in items:
                     if isinstance(item, dict):
                         events.extend(normalize_signal_item(item, chain))
@@ -234,16 +242,25 @@ class OkxDexRest:
                 age_ms = now_ms - event_ts if event_ts else max_age_ms + 1
                 if 0 <= age_ms <= max_age_ms:
                     fresh_events.append(event)
+            fresh_counts_by_chain = {chain: 0 for chain in self.chain_indexes}
+            for event in fresh_events:
+                chain = str(event.get("chainIndex") or "")
+                if chain:
+                    fresh_counts_by_chain[chain] = fresh_counts_by_chain.get(chain, 0) + 1
             self.last_signal_ok = True
             self.last_signal_error = ""
             self.last_signal_raw_count = raw_count
             self.last_signal_count = len(fresh_events)
+            self.last_signal_raw_counts_by_chain = raw_counts_by_chain
+            self.last_signal_counts_by_chain = fresh_counts_by_chain
             return fresh_events
         except OkxDexRestError as exc:
             self.last_signal_ok = False
             self.last_signal_error = str(exc)
             self.last_signal_raw_count = raw_count
             self.last_signal_count = 0
+            self.last_signal_raw_counts_by_chain = raw_counts_by_chain
+            self.last_signal_counts_by_chain = {}
             return []
 
     def fetch_prices(self, items: Iterable[Dict[str, Any]]) -> Dict[str, float]:
@@ -256,7 +273,7 @@ class OkxDexRest:
                 item.get("tokenContractAddress") or item.get("token_ca") or ""
             ).strip()
             if chain and contract:
-                if chain == "56":
+                if chain in EVM_CHAIN_INDEXES:
                     contract = contract.lower()
                 request_items.append({
                     "chainIndex": chain,
@@ -266,11 +283,13 @@ class OkxDexRest:
             self.last_price_ok = True
             self.last_price_error = ""
             self.last_price_count = 0
+            self.last_price_counts_by_chain = {}
             return {}
 
         try:
             response = self._post(PRICE_PATH, request_items)
             result = {}
+            price_counts_by_chain: Dict[str, int] = {}
             for item in response.get("data") or []:
                 if not isinstance(item, dict):
                     continue
@@ -281,15 +300,18 @@ class OkxDexRest:
                 except (TypeError, ValueError):
                     price = 0.0
                 if chain and contract and price > 0:
-                    result[f"{chain}:{contract.lower() if chain == '56' else contract}"] = price
+                    result[f"{chain}:{contract.lower() if chain in EVM_CHAIN_INDEXES else contract}"] = price
+                    price_counts_by_chain[chain] = price_counts_by_chain.get(chain, 0) + 1
             self.last_price_ok = True
             self.last_price_error = ""
             self.last_price_count = len(result)
+            self.last_price_counts_by_chain = price_counts_by_chain
             return result
         except OkxDexRestError as exc:
             self.last_price_ok = False
             self.last_price_error = str(exc)
             self.last_price_count = 0
+            self.last_price_counts_by_chain = {}
             return {}
 
     def status(self) -> Dict[str, Any]:
@@ -301,9 +323,12 @@ class OkxDexRest:
             "last_signal_error": self.last_signal_error,
             "last_signal_count": self.last_signal_count,
             "last_signal_raw_count": self.last_signal_raw_count,
+            "last_signal_counts_by_chain": dict(self.last_signal_counts_by_chain),
+            "last_signal_raw_counts_by_chain": dict(self.last_signal_raw_counts_by_chain),
             "last_price_ok": self.last_price_ok,
             "last_price_error": self.last_price_error,
             "last_price_count": self.last_price_count,
+            "last_price_counts_by_chain": dict(self.last_price_counts_by_chain),
             "request_count": self.request_count,
             "last_request_ts": self.last_request_ts,
             "chain_indexes": list(self.chain_indexes),

@@ -68,6 +68,46 @@ class ActivePipelineTests(unittest.TestCase):
         self.assertTrue(rest.last_price_ok)
         self.assertEqual(prices["501:TokenCA"], 1.5)
 
+    def test_okx_v6_rest_supports_robinhood_chain_index(self):
+        rest = okx_dex_rest.OkxDexRest(chain_indexes=["4663"])
+        with mock.patch.object(rest, "_post", return_value={
+            "code": "0",
+            "data": [{
+                "chainIndex": "4663",
+                "timestamp": int(time.time() * 1000) - 1000,
+                "token": {
+                    "tokenAddress": "0xABCDEF",
+                    "symbol": "RH",
+                    "marketCapUsd": "55000",
+                },
+                "price": "2.5",
+                "walletType": "SMART_MONEY",
+                "triggerWalletCount": "1",
+                "triggerWalletAddress": "wallet-rh",
+            }],
+        }):
+            events = rest.fetch_signal_events()
+        self.assertTrue(rest.last_signal_ok)
+        self.assertEqual(events[0]["chainIndex"], "4663")
+
+        with mock.patch.object(rest, "_post", return_value={
+            "code": "0",
+            "data": [{
+                "chainIndex": "4663",
+                "tokenContractAddress": "0xabcdef",
+                "price": "2.5",
+            }],
+        }):
+            prices = rest.fetch_prices([{
+                "chainIndex": "4663",
+                "tokenContractAddress": "0xABCDEF",
+            }])
+        self.assertEqual(prices["4663:0xabcdef"], 2.5)
+        status = rest.status()
+        self.assertEqual(status["last_signal_raw_counts_by_chain"]["4663"], 1)
+        self.assertEqual(status["last_signal_counts_by_chain"]["4663"], 1)
+        self.assertEqual(status["last_price_counts_by_chain"]["4663"], 1)
+
     def test_monitor_prefers_okx_v6_rest_signal_source(self):
         class RestSource:
             last_signal_ok = True
@@ -112,7 +152,7 @@ class ActivePipelineTests(unittest.TestCase):
 
     def test_runtime_config_applies_without_restart_and_rebuilds_exit_tiers(self):
         original = monitor.runtime_config_snapshot()
-        editable = {key: value for key, value in original.items() if key != "bsc_baw_enabled"}
+        editable = {key: value for key, value in original.items() if key not in ("bsc_baw_enabled", "chains")}
         try:
             with mock.patch.object(monitor, "_write_runtime_config"):
                 applied = monitor.apply_runtime_config({
@@ -131,6 +171,29 @@ class ActivePipelineTests(unittest.TestCase):
         finally:
             monitor.apply_runtime_config(editable, persist=False)
 
+    def test_chain_runtime_config_isolated_by_chain(self):
+        original = {
+            chain: dict(monitor.CHAIN_CONFIGS[chain])
+            for chain in monitor.CHAIN_NAMES
+        }
+        try:
+            with mock.patch.object(monitor, "_write_runtime_config"):
+                applied = monitor.apply_chain_config("robinhood", {
+                    "min_mcap": 70000,
+                    "max_positions": 2,
+                    "buy_size_usdt": 8,
+                    "min_buy_size": 3,
+                    "max_buy_size": 12,
+                })
+            self.assertEqual(applied["min_mcap"], 70000)
+            self.assertEqual(monitor.get_chain_config("robinhood")["max_positions"], 2)
+            self.assertNotEqual(monitor.get_chain_config("bsc")["min_mcap"], 70000)
+            self.assertNotEqual(monitor.get_chain_config("solana")["max_positions"], 2)
+        finally:
+            monitor.CHAIN_CONFIGS = {
+                chain: dict(values) for chain, values in original.items()
+            }
+
     def test_dashboard_config_validation_rejects_unsafe_values(self):
         self.assertEqual(
             dashboard_server.normalize_config_updates({"max_positions": 4, "risk_pct": 0.01}),
@@ -138,6 +201,19 @@ class ActivePipelineTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             dashboard_server.normalize_config_updates({"max_positions": 0})
+
+    def test_dashboard_chain_config_rejects_global_only_fields(self):
+        self.assertEqual(
+            dashboard_server.normalize_config_updates(
+                {"min_mcap": 70000, "fast_exit_mode": True},
+                dashboard_server.CHAIN_CONFIG_LIMITS,
+            ),
+            {"min_mcap": 70000, "fast_exit_mode": True},
+        )
+        with self.assertRaises(ValueError):
+            dashboard_server.normalize_config_updates(
+                {"poll_sec": 5}, dashboard_server.CHAIN_CONFIG_LIMITS
+            )
 
     def test_legacy_ws_facade_has_only_dex_v6_transport(self):
         with open(os.path.join(SCRIPTS, "ws_price_feed.py"), encoding="utf-8") as handle:

@@ -1,6 +1,6 @@
 # Memecoin Agent
 
-Solana + BSC 链智能跟单系统 — 基于链上 Smart Money 信号的自动化交易框架。
+Solana + BSC + Robinhood 链智能跟单系统 — 基于链上 Smart Money 信号的自动化交易框架。
 
 ## 核心功能
 
@@ -9,19 +9,21 @@ Solana + BSC 链智能跟单系统 — 基于链上 Smart Money 信号的自动�
 - **安全评分开仓** — 买入前 5 维评估（蜜罐/税率/冲击/流动性/持币集中度）
 - **快速退出** — 默认 +10% 全仓退出；旧阶梯模式可通过 `FAST_EXIT_MODE=0` 启用
 - **多维风控** — 止损 -8%、soldRatio 跟卖、最大持仓时间和连续止损冻结
-- **双链支持** — Solana + BSC 市场数据统一走 OKX DEX V6 REST；BAW BSC 执行器默认暂停
+- **三链市场数据** — Solana(501)、BSC(56)、Robinhood(4663) 统一走 OKX DEX V6 REST；BAW BSC 执行器默认暂停
+- **按链策略配置** — Dashboard 可分别设置三条链的市值门槛、共识钱包、单笔金额、止损、止盈和持仓上限
 - **交易历史** — 完整记录每笔买入到卖出的 PnL、持有时间、出场原因
 
 ## 架构
 
 ```
-OKX DEX V6 REST signal/list（501 Solana + 56 BSC）
+OKX DEX V6 REST signal/list（501 Solana + 56 BSC + 4663 Robinhood）
     ↓
 realtime_sm_monitor.py ← 主循环
     ├── 持仓价格: OKX V6 REST market/price
     ├── 安全检查: safety_check.py (5 维评分, score≥70 开仓)
     ├── 买入/卖出: DRY-RUN 默认只记账；实盘执行需显式启用对应执行器
     ├── BSC BAW: BSC_BAW_ENABLED=1 才启用，默认暂停
+    ├── Robinhood: 当前接入 OKX 市场数据，暂不启用真实钱包/交易执行器
     ├── 卖出: 快速止盈 / 跟卖 / SL / 持仓超时
     └── 状态: data/sm_monitor_state*.json (持仓 + 交易历史)
 ```
@@ -112,7 +114,7 @@ realtime_sm_monitor.py ← 主循环
 - **最大持仓**：3 个 token 同时
 - **日亏上限**：-5% 暂停当日交易
 - **连续止损**：3 次 SL 冻结 2 小时
-- **链范围**：Solana + BSC
+- **链范围**：Solana + BSC + Robinhood（市场数据）
 
 ## 快速开始
 
@@ -169,7 +171,7 @@ MAX_HOLD_HOURS = 2
 `BSC_BAW_ENABLED=0`（默认）暂停 BAW；BSC 信号和价格仍由 OKX DEX V6 REST 提供。
 只有明确设置 `BSC_BAW_ENABLED=1`，才允许 BSC BAW 钱包余额、限价单和交易路径参与实盘流程。
 
-运行中的策略参数可以直接在 Dashboard 修改，配置会写入 `data/sm_runtime_config.json`，由模拟盘下一轮轮询读取，无需重启。
+运行中的策略参数可以直接在 Dashboard 修改。选择 Solana、BSC 或 Robinhood 后，配置只作用于所选链；选择“全局”时可修改日/月亏损上限和轮询周期。配置会写入 `data/sm_runtime_config.json`，由模拟盘下一轮轮询读取，无需重启。
 
 ## 数据文件
 
