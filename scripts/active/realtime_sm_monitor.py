@@ -1,8 +1,8 @@
 """
 
-realtime_sm_monitor.py v3.3 ??(Bug ?
+realtime_sm_monitor.py v3.3 REST signal monitor
 
-onchainos tracker activities REST
+OKX OnchainOS V6 REST signal/price API, with OnchainOS CLI fallback
 
 
 
@@ -38,13 +38,15 @@ except ImportError:
 sys.stdout.reconfigure(encoding='utf-8')
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_WS_CLIENT = None  # WebSocket primary data source (direct OKX DEX WS v6)
+_WS_CLIENT = None  # Kept for compatibility; REST is the active primary source.
+_REST_CLIENT = None  # Direct OKX OnchainOS DEX REST V6 client.
 _price_cache = {}  # {token_ca_lower: (price_float, timestamp)}
 _ws_sl_lock = None  # threading.Lock — WS instant SL thread safety (init in main)
 _ws_last_restart = 0  # throttle WS restart attempts
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from okx_dex_ws import OkxDexWs
+from okx_dex_rest import OkxDexRest
 
 try:
     from qclaw_trading_common import (  # noqa: E402
@@ -566,6 +568,11 @@ def log(msg):
 def write_runtime_status(status, state=None, note=''):
     """Publish a small read-only heartbeat for the local dashboard."""
     ws_client = _WS_CLIENT
+    rest_client = _REST_CLIENT
+    try:
+        rest_status = rest_client.status() if rest_client else {}
+    except Exception:
+        rest_status = {}
     ready_attr = (
         getattr(ws_client, 'is_feed_ready', getattr(ws_client, 'is_ready', False))
         if ws_client else False
@@ -600,6 +607,18 @@ def write_runtime_status(status, state=None, note=''):
         'ws_feed_status': getattr(ws_client, 'feed_status', '') if ws_client else '',
         'ws_subscribed_channels': getattr(ws_client, 'subscribed_channels', []) if ws_client else [],
         'ws_subscription_errors': getattr(ws_client, 'subscription_errors', []) if ws_client else [],
+        'rest_primary': bool(rest_client and getattr(rest_client, 'enabled', False)),
+        'rest_mode': rest_status.get('mode', ''),
+        'rest_last_signal_ok': rest_status.get('last_signal_ok'),
+        'rest_last_signal_error': rest_status.get('last_signal_error', ''),
+        'rest_last_signal_count': rest_status.get('last_signal_count', 0),
+        'rest_last_signal_raw_count': rest_status.get('last_signal_raw_count', 0),
+        'rest_last_price_ok': rest_status.get('last_price_ok'),
+        'rest_last_price_error': rest_status.get('last_price_error', ''),
+        'rest_last_price_count': rest_status.get('last_price_count', 0),
+        'rest_request_count': rest_status.get('request_count', 0),
+        'rest_last_request_ts': rest_status.get('last_request_ts', 0),
+        'rest_chain_indexes': rest_status.get('chain_indexes', []),
         'state_last_poll': (state or {}).get('last_poll', 0),
         'positions': len((state or {}).get('positions', {})),
     }
@@ -1385,9 +1404,22 @@ def sync_ws_price_subscriptions(positions):
 
 def fetch_tracker(state=None):
 
-    """Fetch recent smart money trades -- WS primary, REST fallback."""
+    """Fetch recent Smart Money trades from OKX V6 REST first.
 
-    global _WS_CLIENT
+    The direct V6 REST endpoint is the active source.  The legacy WS path is
+    retained only for compatibility tests/launchers, and the OnchainOS CLI
+    remains a secondary fallback when the direct REST entitlement fails.
+    """
+
+    global _WS_CLIENT, _REST_CLIENT
+
+    if _REST_CLIENT is not None:
+        rest_trades = _REST_CLIENT.fetch_signal_events()
+        if getattr(_REST_CLIENT, 'last_signal_ok', False):
+            return rest_trades
+        log('OKX V6 REST signal unavailable, using secondary fallback: ' + str(
+            getattr(_REST_CLIENT, 'last_signal_error', 'unknown error')
+        ))
 
     # Drain WS first even if the socket closed after buffering an event.
     if _WS_CLIENT:
@@ -2033,7 +2065,7 @@ def get_balance(chain='solana'):
 
 def get_token_price_usd(chain, token_ca, retries=MAX_PRICE_RETRIES):
 
-    """Fetch real-time price -- WS cache first, REST fallback."""
+    """Fetch price -- OKX V6 REST first, then cache/CLI fallback."""
 
     _ca = token_ca.lower()
     _now = time.time()
@@ -2045,7 +2077,19 @@ def get_token_price_usd(chain, token_ca, retries=MAX_PRICE_RETRIES):
         if _now - _ts < 10:
             return _price
 
-    # Cache miss or stale -- fetch via REST
+    # Cache miss or stale -- use the direct OKX V6 REST price endpoint.
+    if _REST_CLIENT is not None:
+        rest_prices = _REST_CLIENT.fetch_prices([{
+            'chainIndex': _ws_chain_index(chain),
+            'tokenContractAddress': token_ca,
+        }])
+        _rest_key = f"{_ws_chain_index(chain)}:{token_ca.lower() if _ws_chain_index(chain) == '56' else token_ca}"
+        _rest_price = rest_prices.get(_rest_key)
+        if _rest_price and _rest_price > 0:
+            _price_cache[_ca] = (_rest_price, _now)
+            return _rest_price
+
+    # Secondary fallback through the OnchainOS CLI.
     for attempt in range(retries + 1):
 
         out, _ = oc_run([
@@ -3335,21 +3379,23 @@ def main():
 
     wallets = load_wallets()
 
-    # Start WebSocket as primary data source (direct OKX DEX WS v6)
-    global _WS_CLIENT, _ws_sl_lock
+    # Use direct OKX OnchainOS REST V6 for signals and prices.  The WS client
+    # is intentionally not started while the account is not whitelisted.
+    global _WS_CLIENT, _REST_CLIENT, _ws_sl_lock
     _ws_sl_lock = threading.Lock()
+    _WS_CLIENT = None
     try:
-        _WS_CLIENT = OkxDexWs()
-        if _WS_CLIENT.start():
-            log('WS data source started')
-            write_runtime_status('running', state, 'WS primary')
+        _REST_CLIENT = OkxDexRest(chain_indexes=('501', '56'))
+        if _REST_CLIENT.enabled:
+            log('OKX V6 REST signal/price source started')
+            write_runtime_status('running', state, 'OKX V6 REST primary')
         else:
-            log('WS unavailable, using REST fallback')
-            _WS_CLIENT = None
-            write_runtime_status('running', state, 'REST fallback')
+            log('OKX V6 REST credentials unavailable, using OnchainOS fallback')
+            write_runtime_status('running', state, 'OnchainOS secondary fallback')
     except Exception as e:
-        log(f'WS start failed: {e}, using REST fallback')
-        write_runtime_status('running', state, 'REST fallback')
+        log(f'OKX V6 REST start failed: {e}, using OnchainOS fallback')
+        _REST_CLIENT = None
+        write_runtime_status('running', state, 'OnchainOS secondary fallback')
 
 
     runtime_stop, runtime_thread = start_runtime_heartbeat(state)
@@ -3398,11 +3444,8 @@ def main():
                 time.sleep(TRACKER_POLL_SEC * 3)
                 continue
 
-            log(f'--- wait up to {TRACKER_POLL_SEC}s (WS event wakes immediately) ---')
-            if _WS_CLIENT and hasattr(_WS_CLIENT, 'wait_for_events'):
-                _WS_CLIENT.wait_for_events(TRACKER_POLL_SEC)
-            else:
-                time.sleep(TRACKER_POLL_SEC)
+            log(f'--- REST poll again in {TRACKER_POLL_SEC}s ---')
+            time.sleep(TRACKER_POLL_SEC)
 
     except KeyboardInterrupt:
 

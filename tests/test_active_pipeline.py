@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -13,6 +14,7 @@ sys.path.insert(0, SCRIPTS)
 sys.path.insert(0, Dashboard)
 
 import okx_dex_ws  # noqa: E402
+import okx_dex_rest  # noqa: E402
 import ws_price_feed  # noqa: E402
 import qclaw_trading_common as common  # noqa: E402
 import realtime_sm_monitor as monitor  # noqa: E402
@@ -20,6 +22,82 @@ import dashboard_server  # noqa: E402
 
 
 class ActivePipelineTests(unittest.TestCase):
+    def test_okx_v6_rest_normalizes_signal_list(self):
+        rest = okx_dex_rest.OkxDexRest(chain_indexes=["501"])
+        with mock.patch.object(rest, "_post", return_value={
+            "code": "0",
+            "data": [{
+                "chainIndex": "501",
+                "timestamp": int(time.time() * 1000) - 1000,
+                "token": {
+                    "tokenAddress": "TokenCA",
+                    "symbol": "T",
+                    "marketCapUsd": "45000",
+                },
+                "price": "1.25",
+                "walletType": "SMART_MONEY",
+                "triggerWalletCount": "2",
+                "triggerWalletAddress": "wallet-a,wallet-b",
+                "amountUsd": "1200",
+                "soldRatioPercent": "0",
+            }],
+        }):
+            events = rest.fetch_signal_events()
+        self.assertTrue(rest.last_signal_ok)
+        self.assertEqual(rest.last_signal_raw_count, 1)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["source"], "okx_v6_rest_signal")
+        self.assertEqual(events[0]["tradeType"], "1")
+        self.assertEqual(events[0]["tokenContractAddress"], "TokenCA")
+        self.assertNotEqual(events[0]["txHash"], events[1]["txHash"])
+
+    def test_okx_v6_rest_normalizes_batch_prices(self):
+        rest = okx_dex_rest.OkxDexRest(chain_indexes=["501"])
+        with mock.patch.object(rest, "_post", return_value={
+            "code": "0",
+            "data": [{
+                "chainIndex": "501",
+                "tokenContractAddress": "TokenCA",
+                "price": "1.5",
+            }],
+        }):
+            prices = rest.fetch_prices([{
+                "chainIndex": "501",
+                "tokenContractAddress": "TokenCA",
+            }])
+        self.assertTrue(rest.last_price_ok)
+        self.assertEqual(prices["501:TokenCA"], 1.5)
+
+    def test_monitor_prefers_okx_v6_rest_signal_source(self):
+        class RestSource:
+            last_signal_ok = True
+            last_signal_error = ""
+
+            def fetch_signal_events(self):
+                return [{
+                    "event_type": "trade",
+                    "txHash": "rest-signal-1",
+                    "tradeType": "1",
+                }]
+
+        original_rest = monitor._REST_CLIENT
+        original_ws = monitor._WS_CLIENT
+        original_oc_run = monitor.oc_run
+        try:
+            monitor._REST_CLIENT = RestSource()
+            monitor._WS_CLIENT = None
+
+            def fail_if_called(*args, **kwargs):
+                raise AssertionError("OnchainOS fallback should not run after REST success")
+
+            monitor.oc_run = fail_if_called
+            trades = monitor.fetch_tracker({})
+            self.assertEqual(trades[0]["txHash"], "rest-signal-1")
+        finally:
+            monitor._REST_CLIENT = original_rest
+            monitor._WS_CLIENT = original_ws
+            monitor.oc_run = original_oc_run
+
     def test_legacy_ws_facade_has_only_dex_v6_transport(self):
         with open(os.path.join(SCRIPTS, "ws_price_feed.py"), encoding="utf-8") as handle:
             source = handle.read().lower()

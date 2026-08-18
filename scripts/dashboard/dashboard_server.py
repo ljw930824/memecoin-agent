@@ -189,7 +189,19 @@ def build_status():
     ws_ready = bool(runtime.get("ws_ready"))
     ws_authenticated = bool(runtime.get("ws_authenticated"))
     ws_errors = runtime.get("ws_subscription_errors") or []
-    if ws_ready:
+    rest_primary = bool(runtime.get("rest_primary"))
+    rest_signal_ok = runtime.get("rest_last_signal_ok")
+    rest_price_ok = runtime.get("rest_last_price_ok")
+    if rest_primary and rest_signal_ok is False:
+        feed_status = "OKX V6 REST 信号失败，OnchainOS 兜底"
+        feed_class = "warn"
+    elif rest_primary and rest_price_ok is False:
+        feed_status = "OKX V6 REST 信号正常，价格接口失败"
+        feed_class = "warn"
+    elif rest_primary and rest_signal_ok is True:
+        feed_status = "OKX V6 REST 信号/价格轮询中"
+        feed_class = "ok"
+    elif ws_ready:
         feed_status = "WS V6 信号订阅中"
         feed_class = "ok"
     elif ws_authenticated:
@@ -215,6 +227,17 @@ def build_status():
             "ws_authenticated": ws_authenticated,
             "subscribed_channels": runtime.get("ws_subscribed_channels") or [],
             "subscription_errors": ws_errors[-5:],
+            "rest_primary": rest_primary,
+            "rest_mode": runtime.get("rest_mode", ""),
+            "rest_last_signal_ok": rest_signal_ok,
+            "rest_last_signal_error": runtime.get("rest_last_signal_error", ""),
+            "rest_last_signal_count": runtime.get("rest_last_signal_count", 0),
+            "rest_last_signal_raw_count": runtime.get("rest_last_signal_raw_count", 0),
+            "rest_last_price_ok": rest_price_ok,
+            "rest_last_price_error": runtime.get("rest_last_price_error", ""),
+            "rest_last_price_count": runtime.get("rest_last_price_count", 0),
+            "rest_request_count": runtime.get("rest_request_count", 0),
+            "rest_chain_indexes": runtime.get("rest_chain_indexes") or [],
         },
         "risk": {"blocked": risk_blocked, "reason": risk_reason},
         "config": {
