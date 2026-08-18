@@ -14,6 +14,6 @@
 
 - 新增 `scripts/dashboard/dashboard_server.py` 和 `index.html`：本地只读看板读取模拟盘状态、运行心跳、持仓、PnL、风控、交易历史和日志，每 2 秒刷新。
 - 新增 `start_simulation_dashboard.ps1`，用于启动 Dashboard 和 dry-run；当前实际观察使用持续终端会话，避免受限环境回收后台子进程。
-- 模拟盘加入运行心跳文件 `data/sm_monitor_runtime_dryrun.json`；REST 兜底 tracker 调用增加 8 秒超时，避免看板长期无状态更新。
+- 模拟盘加入看板状态文件 `data/dashboard_status.json`；REST 兜底 tracker 调用增加 8 秒超时，避免看板长期无状态更新。
 - 当前环境 Python 3.7，依赖下限调整为 `websocket-client>=1.6,<2`，并安装 1.6.1。
 - Dashboard API 验证通过 HTTP 200；模拟盘当前保持运行，`WS 未就绪 / REST 兜底`，原因是本地网络策略阻止 OKX 套接字（WinError 10013）。

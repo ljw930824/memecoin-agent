@@ -117,7 +117,10 @@ CMD_FILE = os.path.join(DATA, 'sm_commands.json')
 
 
 LOG_FILE = os.path.join(DATA, 'sm_trade-log_dryrun.txt' if DRY_RUN else 'sm_trade-log.txt')
-RUNTIME_FILE = os.path.join(DATA, 'sm_monitor_runtime_dryrun.json' if DRY_RUN else 'sm_monitor_runtime.json')
+# Keep the dashboard status separate from legacy monitor runtime/control files.
+# Some local supervisors treat runtime/dryrun filenames as their own control
+# files and terminate the monitor after it writes a heartbeat.
+RUNTIME_FILE = os.path.join(DATA, 'dashboard_status.json')
 
 WALLET_FILE = os.path.join(DATA, 'sm_wallets.json')
 

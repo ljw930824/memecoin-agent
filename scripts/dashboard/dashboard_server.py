@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 STATIC = Path(__file__).resolve().parent
 STATE_FILE = DATA / "sm_monitor_state_dryrun.json"
-RUNTIME_FILE = DATA / "sm_monitor_runtime_dryrun.json"
+RUNTIME_FILE = DATA / "dashboard_status.json"
 LOG_FILE = DATA / "sm_trade-log_dryrun.txt"
 HK_TZ = timezone(timedelta(hours=8))
 
@@ -57,6 +57,17 @@ def process_alive(pid):
         pid = int(pid or 0)
         if pid <= 0:
             return False
+        if os.name == "nt":
+            # Do not use os.kill(pid, 0) on Windows: its Windows mapping may
+            # terminate the target process instead of probing it.
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
         os.kill(pid, 0)
         return True
     except (OSError, TypeError, ValueError, PermissionError, SystemError):

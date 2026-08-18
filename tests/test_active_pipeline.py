@@ -6,11 +6,14 @@ from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ACTIVE = os.path.join(ROOT, "scripts", "active")
+Dashboard = os.path.join(ROOT, "scripts", "dashboard")
 sys.path.insert(0, ACTIVE)
+sys.path.insert(0, Dashboard)
 
 import okx_dex_ws  # noqa: E402
 import qclaw_trading_common as common  # noqa: E402
 import realtime_sm_monitor as monitor  # noqa: E402
+import dashboard_server  # noqa: E402
 
 
 class ActivePipelineTests(unittest.TestCase):
@@ -169,6 +172,12 @@ class ActivePipelineTests(unittest.TestCase):
             monitor._WS_CLIENT = original_ws
             monitor._price_cache.clear()
             monitor._price_cache.update(original_cache)
+
+    def test_dashboard_pid_probe_is_read_only_on_windows(self):
+        if os.name != "nt":
+            self.skipTest("Windows-specific PID probe")
+        with mock.patch.object(dashboard_server.os, "kill", side_effect=AssertionError("PID probe must not kill")):
+            self.assertTrue(dashboard_server.process_alive(os.getpid()))
 
 
 if __name__ == "__main__":
