@@ -68,6 +68,17 @@
     const tone = value => Number(value)>=0 ? 'green' : 'red';
     function setValue(id, value, cls=''){ const el=$(id); el.textContent=value; el.className=`value ${cls}`; }
     function emptyRow(cols, text){ return `<tr><td colspan="${cols}" class="empty">${esc(text)}</td></tr>`; }
+    const enumLabels = Object.freeze({
+      solana:'Solana', bsc:'BSC', robinhood:'Robinhood',
+      buy:'买入', sell:'卖出', sm_buy:'聪明钱买入', sm_sell:'聪明钱卖出',
+      quick_tp:'快速止盈', quick_tp_dust:'小额快速止盈', stop_loss:'止损',
+      trailing_stop:'移动止损', max_hold_time:'超时退出', dead_position:'失活持仓清理',
+      sm_follow:'聪明钱跟卖', sm_follow_dead:'聪明钱跟卖（空仓清理）',
+      '6h_tp':'6小时止盈', '12h_tp':'12小时止盈', '24h_exit':'24小时退出',
+      '48h_force':'48小时强制退出', external_command:'外部指令', manual:'手动操作',
+      reconcile:'持仓对账', unknown:'未知'
+    });
+    const displayEnum = value => { const text=String(value ?? '--'); return enumLabels[text] || text.replace(/_/g,' '); };
     const configFields = [
       ['min_mcap','cfg_min_mcap',1],['max_positions','cfg_max_positions',1],['min_consensus_wallets','cfg_min_consensus_wallets',1],
       ['min_wallet_winrate','cfg_min_wallet_winrate',100],['buy_size_usdt','cfg_buy_size_usdt',1],['min_buy_size','cfg_min_buy_size',1],['max_buy_size','cfg_max_buy_size',1],
@@ -121,12 +132,12 @@
       $('feedStatus').textContent=data.feed?.status||'--'; $('feedStatus').style.color=data.feed?.class==='ok'?'var(--green)':(data.feed?.class==='bad'?'var(--red)':'var(--amber)');
        const chainLabels={'501':'Solana','56':'BSC','4663':'Robinhood'}; const indexes=data.feed?.rest_chain_indexes||['501','56','4663']; const rawByChain=data.feed?.rest_last_signal_raw_counts_by_chain||{}; const freshByChain=data.feed?.rest_last_signal_counts_by_chain||{}; const chainText=indexes.map(index=>`${chainLabels[index]||index} ${index}: ${rawByChain[index]??0} raw/${freshByChain[index]??0} fresh`).join(' · '); $('chainCoverage').textContent=`${chainText||'链路未上报'} · REST ${data.feed?.rest_last_signal_ok===true?'正常':'检查中'}`;
       $('bscRoute').textContent=data.feed?.bsc_baw_enabled ? 'OKX V6 REST 市场数据 · BAW 执行器已启用' : 'OKX V6 REST 信号/价格 · BAW 已暂停'; $('bscRoute').style.color=data.feed?.bsc_baw_enabled?'var(--amber)':'var(--green)';
-      $('strategyStatus').innerHTML=`${configScope==='global'?'全局':configScope.toUpperCase()} · ${activeCfg.fast_exit_mode?'快速退出':'旧阶梯模式'} · 止盈 <b>${pct(activeCfg.quick_tp_pct)}</b> · 止损 <b>-${(Number(activeCfg.stop_loss_pct||0)*100).toFixed(1)}%</b> · 单笔 $${activeCfg.buy_size_usdt}`;
+      $('strategyStatus').innerHTML=`${configScope==='global'?'全局':displayEnum(configScope)} · ${activeCfg.fast_exit_mode?'快速退出':'旧阶梯模式'} · 止盈 <b>${pct(activeCfg.quick_tp_pct)}</b> · 止损 <b>-${(Number(activeCfg.stop_loss_pct||0)*100).toFixed(1)}%</b> · 单笔 $${activeCfg.buy_size_usdt}`;
       renderConfigForm(cfg);
       $('lastPoll').textContent=`${r.state_last_poll?new Date(Number(r.state_last_poll)*1000).toLocaleString('zh-CN',{hour12:false}):'--'} · 状态延迟 ${m.state_age_sec==null?'--':m.state_age_sec+'s'}`;
       $('lastLog').textContent=data.last_log||'暂无日志';
-      const pb=$('positionsBody'); pb.innerHTML=(data.positions||[]).length ? data.positions.map(p=>`<tr><td><div class="pos-name">${esc(p.symbol)}</div><div class="chain">${esc(p.token_ca).slice(0,18)}…</div></td><td>${esc(p.chain)}</td><td>${esc(p.entry_price)}</td><td>${esc(p.current_price)}</td><td class="${tone(p.pnl_pct)}">${pct(p.pnl_pct)}</td><td>${Number(p.hold_hours).toFixed(2)}h</td><td>${p.sm_sells}</td></tr>`).join('') : emptyRow(7,'当前无持仓');
-      const tb=$('tradesBody'); tb.innerHTML=(data.recent_trades||[]).length ? data.recent_trades.map(t=>`<tr><td>${esc(t.exit_time)}</td><td class="pos-name">${esc(t.symbol)}</td><td>${esc(t.chain)}</td><td class="${tone(t.pnl_pct)}">${pct(t.pnl_pct)} <span class="muted">(${money(t.pnl_usd)})</span></td><td><span class="pill ${Number(t.pnl_pct)>=0?'green':'red'}">${esc(t.reason)}</span></td></tr>`).join('') : emptyRow(5,'暂无已关闭交易');
+      const pb=$('positionsBody'); pb.innerHTML=(data.positions||[]).length ? data.positions.map(p=>`<tr><td><div class="pos-name">${esc(p.symbol)}</div><div class="chain">${esc(p.token_ca).slice(0,18)}…</div></td><td>${esc(displayEnum(p.chain))}</td><td>${esc(p.entry_price)}</td><td>${esc(p.current_price)}</td><td class="${tone(p.pnl_pct)}">${pct(p.pnl_pct)}</td><td>${Number(p.hold_hours).toFixed(2)}h</td><td>${p.sm_sells}</td></tr>`).join('') : emptyRow(7,'当前无持仓');
+      const tb=$('tradesBody'); tb.innerHTML=(data.recent_trades||[]).length ? data.recent_trades.map(t=>`<tr><td>${esc(t.exit_time)}</td><td class="pos-name">${esc(t.symbol)}</td><td>${esc(displayEnum(t.chain))}</td><td class="${tone(t.pnl_pct)}">${pct(t.pnl_pct)} <span class="muted">(${money(t.pnl_usd)})</span></td><td><span class="pill ${Number(t.pnl_pct)>=0?'green':'red'}">${esc(displayEnum(t.reason))}</span></td></tr>`).join('') : emptyRow(5,'暂无已关闭交易');
       $('logs').textContent=(data.logs||[]).join('\n')||'暂无日志'; $('logs').scrollTop=$('logs').scrollHeight; $('updatedAt').textContent=`看板更新时间：${new Date(data.generated_at).toLocaleString('zh-CN',{hour12:false})}`;
     }
     async function refresh(){ try{ const res=await fetch(`/api/status?t=${Date.now()}`,{cache:'no-store'}); if(!res.ok) throw new Error(res.status); render(await res.json()); }catch(e){ $('notice').className='notice'; $('notice').textContent=`看板读取失败：${e.message}`; $('runtimeStatus').textContent='数据读取失败'; $('runtimeDot').className='dot bad'; } }
