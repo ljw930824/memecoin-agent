@@ -59,7 +59,11 @@ realtime_sm_monitor.py ← 主循环
 ## 入场策略
 
 ### 信号来源
-- OKX DEX WebSocket tracker activity（主路径）
+- OKX DEX WebSocket V6（`wss://wsdex.okx.com/ws/v6/dex`）
+- `kol_smartmoney-tracker-activity`：Smart Money/KOL 动态，字段在 V6 `data[]`
+- `dex-market-new-signal-openapi`：新信号，按单链 `chainIndex` 订阅，字段在 V6 `arg`
+- 只有登录成功且至少一个入场频道订阅成功，才视为 WS 入场源可用；否则自动 REST 兜底
+- 信号频道需要 OKX 侧权限/白名单，`60029` 不会再被误判为“WS 已就绪”
 - 筛选条件：至少 1 个符合条件的钱包买入同一 token
 - 市值门槛：mcap ≥ $30K
 - 抛压过滤：soldRatio < 30%

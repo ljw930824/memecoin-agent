@@ -566,11 +566,22 @@ def log(msg):
 def write_runtime_status(status, state=None, note=''):
     """Publish a small read-only heartbeat for the local dashboard."""
     ws_client = _WS_CLIENT
-    ready_attr = getattr(ws_client, 'is_ready', False) if ws_client else False
+    ready_attr = (
+        getattr(ws_client, 'is_feed_ready', getattr(ws_client, 'is_ready', False))
+        if ws_client else False
+    )
     try:
         ws_ready = ready_attr() if callable(ready_attr) else bool(ready_attr)
     except Exception:
         ws_ready = False
+    auth_attr = (
+        getattr(ws_client, 'is_authenticated', getattr(ws_client, 'is_ready', False))
+        if ws_client else False
+    )
+    try:
+        ws_authenticated = auth_attr() if callable(auth_attr) else bool(auth_attr)
+    except Exception:
+        ws_authenticated = False
     try:
         ws_alive = bool(ws_client and ws_client.is_alive()) if ws_client else False
     except Exception:
@@ -584,7 +595,11 @@ def write_runtime_status(status, state=None, note=''):
         'updated_ts': time.time(),
         'updated_at': datetime.now(timezone(timedelta(hours=8))).isoformat(),
         'ws_ready': ws_ready,
+        'ws_authenticated': ws_authenticated,
         'ws_alive': ws_alive,
+        'ws_feed_status': getattr(ws_client, 'feed_status', '') if ws_client else '',
+        'ws_subscribed_channels': getattr(ws_client, 'subscribed_channels', []) if ws_client else [],
+        'ws_subscription_errors': getattr(ws_client, 'subscription_errors', []) if ws_client else [],
         'state_last_poll': (state or {}).get('last_poll', 0),
         'positions': len((state or {}).get('positions', {})),
     }
@@ -1396,7 +1411,11 @@ def fetch_tracker(state=None):
 
         # A healthy WS is event-driven. Do not call REST while it is merely
         # idle: that would block the main thread and defeat the wake-up path.
-        ws_ready_attr = getattr(_WS_CLIENT, 'is_ready', False)
+        ws_ready_attr = getattr(
+            _WS_CLIENT,
+            'is_feed_ready',
+            getattr(_WS_CLIENT, 'is_ready', False),
+        )
         ws_ready = ws_ready_attr() if callable(ws_ready_attr) else bool(ws_ready_attr)
         if ws_ready:
             return []
@@ -3173,13 +3192,17 @@ def run_once(state, wallets):
                 ws_alive = _WS_CLIENT._thread.is_alive()
         except Exception:
             ws_alive = False
-        ws_ready = True
+        ws_authenticated = True
         try:
-            ready_attr = getattr(_WS_CLIENT, 'is_ready', True)
-            ws_ready = ready_attr() if callable(ready_attr) else bool(ready_attr)
+            auth_attr = getattr(
+                _WS_CLIENT,
+                'is_authenticated',
+                getattr(_WS_CLIENT, 'is_ready', True),
+            )
+            ws_authenticated = auth_attr() if callable(auth_attr) else bool(auth_attr)
         except Exception:
-            ws_ready = False
-        if not ws_alive or not ws_ready:
+            ws_authenticated = False
+        if not ws_alive or not ws_authenticated:
             if time.time() - _ws_last_restart > 60:
                 log('WS client unavailable, restarting...')
                 try:

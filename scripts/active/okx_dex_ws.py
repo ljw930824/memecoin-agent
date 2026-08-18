@@ -30,12 +30,13 @@ except ImportError:
 
 logger = logging.getLogger("okx_dex_ws")
 
-WS_URL = "wss://wsdex.okx.com/ws/v6/dex"
+WS_URL = os.environ.get("OKX_DEX_WS_URL", "wss://wsdex.okx.com/ws/v6/dex")
 PING_INTERVAL = 25  # seconds
 RECONNECT_DELAY = 5  # seconds
 MAX_QUEUE_SIZE = 5000
 SMART_MONEY_ACTIVITY_CHANNEL = "kol_smartmoney-tracker-activity"
 SIGNAL_CHANNEL = "dex-market-new-signal-openapi"
+ENTRY_CHANNELS = frozenset((SMART_MONEY_ACTIVITY_CHANNEL, SIGNAL_CHANNEL))
 
 # tradeType: "1"=buy, "2"=sell (same format as REST tracker, no conversion needed)
 
@@ -157,6 +158,7 @@ def _normalize_signal_events(signal: dict, channel_arg: dict) -> list:
     a transaction hash.  Stable synthetic hashes make the existing state
     deduplication safe without pretending these are on-chain tx hashes.
     """
+    signal = signal or {}
     token = signal.get("token", {}) or {}
     chain = (
         signal.get("chainIndex")
@@ -166,7 +168,12 @@ def _normalize_signal_events(signal: dict, channel_arg: dict) -> list:
     )
     chain_text = str(chain).strip().lower()
     chain = {"solana": "501", "bsc": "56", "bnb": "56"}.get(chain_text, str(chain))
-    token_ca = token.get("tokenAddress") or signal.get("tokenContractAddress") or ""
+    token_ca = (
+        token.get("tokenAddress")
+        or token.get("tokenContractAddress")
+        or signal.get("tokenContractAddress")
+        or ""
+    )
     if not chain or not token_ca:
         return []
 
@@ -177,14 +184,18 @@ def _normalize_signal_events(signal: dict, channel_arg: dict) -> list:
     if "1" not in wallet_types:
         return []
 
-    wallet_text = str(signal.get("triggerWalletAddress", ""))
-    wallets = [item.strip() for item in wallet_text.split(",") if item.strip()] or ["signal"]
+    wallet_value = signal.get("triggerWalletAddress", "")
+    if isinstance(wallet_value, (list, tuple)):
+        wallets = [str(item).strip() for item in wallet_value if str(item).strip()]
+    else:
+        wallets = [item.strip() for item in str(wallet_value).split(",") if item.strip()]
+    wallets = wallets or ["signal"]
     common = {
         "event_type": "trade",
         "signal_type": "smart_money_signal",
         "chainIndex": chain,
         "tokenContractAddress": token_ca,
-        "tokenSymbol": token.get("symbol", ""),
+        "tokenSymbol": token.get("symbol") or token.get("tokenSymbol", ""),
         "marketCap": token.get("marketCapUsd") or signal.get("marketCapUsd", ""),
         "quoteTokenAmount": signal.get("amountUsd", ""),
         "quoteTokenSymbol": "USD",
@@ -248,6 +259,9 @@ class OkxDexWs:
         self._connected = False
         self._logged_in = False
         self._subscribed = set()
+        self._entry_subscribed = set()
+        self._subscription_pending = set()
+        self._subscription_errors = []
         self._price_subscriptions = set()
         self._subscription_lock = threading.Lock()
         self._event_count = 0
@@ -265,8 +279,38 @@ class OkxDexWs:
 
     @property
     def is_ready(self) -> bool:
-        """True only after transport login has succeeded."""
+        """True only when V6 login and at least one entry feed subscribe succeed."""
+        return self.is_authenticated and bool(self._entry_subscribed)
+
+    @property
+    def is_authenticated(self) -> bool:
+        """True when the V6 transport is connected and login succeeded."""
         return self._connected and self._logged_in
+
+    @property
+    def is_feed_ready(self) -> bool:
+        """Alias used by the monitor to distinguish login from feed readiness."""
+        return self.is_ready
+
+    @property
+    def subscribed_channels(self) -> list:
+        return sorted({key[0] for key in self._subscribed})
+
+    @property
+    def subscription_errors(self) -> list:
+        return list(self._subscription_errors)
+
+    @property
+    def feed_status(self) -> str:
+        if not self._connected:
+            return "disconnected"
+        if not self._logged_in:
+            return "authenticating"
+        if self._entry_subscribed:
+            return "ready"
+        if self._subscription_errors:
+            return "authenticated_no_entry_subscription"
+        return "authenticated_waiting_subscription"
 
     def is_alive(self) -> bool:
         """Check if the WS thread is still running."""
@@ -397,6 +441,9 @@ class OkxDexWs:
         self._connected = True
         self._logged_in = False
         self._subscribed.clear()
+        self._entry_subscribed.clear()
+        self._subscription_pending.clear()
+        self._subscription_errors.clear()
         logger.info("WS connected, authenticating...")
 
         ts, sign = _make_sign(self.secret)
@@ -412,10 +459,13 @@ class OkxDexWs:
         ws.send(json.dumps(login))
 
     def _on_message(self, ws, message):
-        try:
-            data = json.loads(message)
-        except json.JSONDecodeError:
-            return
+        if isinstance(message, dict):
+            data = message
+        else:
+            try:
+                data = json.loads(message)
+            except (TypeError, json.JSONDecodeError):
+                return
 
         op = data.get("op", "")
         event = data.get("event", "")
@@ -440,7 +490,11 @@ class OkxDexWs:
         if event == "subscribe":
             arg = data.get("arg", {})
             ch = arg.get("channel", "?")
-            self._subscribed.add(ch)
+            key = self._subscription_key(arg)
+            self._subscribed.add(key)
+            self._subscription_pending.discard(key)
+            if ch in ENTRY_CHANNELS:
+                self._entry_subscribed.add(key)
             logger.info(
                 "WS subscribed: %s %s %s",
                 ch,
@@ -451,7 +505,22 @@ class OkxDexWs:
 
         # Error
         if event == "error":
-            logger.error(f"WS error: {data.get('msg', '')} (code={data.get('code')})")
+            code = str(data.get("code") or "")
+            msg = data.get("msg", "")
+            pending_channels = sorted({key[0] for key in self._subscription_pending})
+            self._subscription_errors.append({
+                "code": code,
+                "message": msg,
+                "pending_channels": pending_channels,
+                "ts": time.time(),
+            })
+            self._subscription_errors = self._subscription_errors[-20:]
+            logger.error(
+                "WS subscription error: %s (code=%s; pending=%s)",
+                msg,
+                code,
+                ",".join(pending_channels) or "unknown",
+            )
             self._error_count += 1
             return
 
@@ -470,8 +539,15 @@ class OkxDexWs:
             signal_arg = data.get("arg", {}) or {}
             if event == "" and signal_arg.get("channel") == SIGNAL_CHANNEL:
                 channel_arg = signal_arg
+                # V6 puts the signal fields under arg (not data[]). Keep the
+                # optional signal wrapper for compatibility with early payloads.
                 signal_payload = data.get("signal") or channel_arg
-                normalized_events = _normalize_signal_events(signal_payload, channel_arg)
+                if isinstance(signal_payload, list):
+                    normalized_events = []
+                    for signal_item in signal_payload:
+                        normalized_events.extend(_normalize_signal_events(signal_item, channel_arg))
+                else:
+                    normalized_events = _normalize_signal_events(signal_payload, channel_arg)
             else:
                 normalized_events = []
 
@@ -502,6 +578,8 @@ class OkxDexWs:
         self._connected = False
         self._logged_in = False
         self._subscribed.clear()
+        self._entry_subscribed.clear()
+        self._subscription_pending.clear()
         logger.info(f"WS closed (code={close_code}, msg={close_msg})")
 
     def _subscribe_all(self, ws):
@@ -519,23 +597,33 @@ class OkxDexWs:
             self._send_subscription(ws, "subscribe", channel, chain, token_ca)
 
     @staticmethod
-    def _send_channel_subscription(ws, op: str, channel: str, chain: str = ""):
+    def _subscription_key(arg: dict) -> tuple:
+        return (
+            str(arg.get("channel") or ""),
+            str(arg.get("chainIndex") or ""),
+            str(arg.get("tokenContractAddress") or ""),
+        )
+
+    def _send_channel_subscription(self, ws, op: str, channel: str, chain: str = ""):
         args = {"channel": channel}
         if chain:
             args["chainIndex"] = chain
+        if op == "subscribe":
+            self._subscription_pending.add(self._subscription_key(args))
         try:
             ws.send(json.dumps({"op": op, "args": [args]}))
             time.sleep(0.05)
         except Exception as exc:
             logger.warning("WS %s failed for %s/%s: %s", op, channel, chain, exc)
 
-    @staticmethod
-    def _send_subscription(ws, op: str, channel: str, chain: str, token_ca: str):
+    def _send_subscription(self, ws, op: str, channel: str, chain: str, token_ca: str):
         args = {
             "channel": channel,
             "chainIndex": chain,
             "tokenContractAddress": token_ca,
         }
+        if op == "subscribe":
+            self._subscription_pending.add(self._subscription_key(args))
         try:
             ws.send(json.dumps({"op": op, "args": [args]}))
             time.sleep(0.05)

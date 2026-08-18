@@ -187,9 +187,14 @@ def build_status():
     log_lines = [line.rstrip("\r\n") for line in read_log_tail()]
     last_log = log_lines[-1] if log_lines else "暂无模拟盘日志"
     ws_ready = bool(runtime.get("ws_ready"))
+    ws_authenticated = bool(runtime.get("ws_authenticated"))
+    ws_errors = runtime.get("ws_subscription_errors") or []
     if ws_ready:
-        feed_status = "WS 已登录"
+        feed_status = "WS V6 信号订阅中"
         feed_class = "ok"
+    elif ws_authenticated:
+        feed_status = "WS V6 已登录，信号频道未就绪，REST 兜底"
+        feed_class = "warn"
     elif runtime.get("process_status") in ("running", "starting"):
         feed_status = "REST 兜底（WS 未就绪）"
         feed_class = "warn"
@@ -204,7 +209,13 @@ def build_status():
         "generated_at": datetime.now(HK_TZ).isoformat(),
         "mode": "DRY-RUN",
         "runtime": runtime,
-        "feed": {"status": feed_status, "class": feed_class},
+        "feed": {
+            "status": feed_status,
+            "class": feed_class,
+            "ws_authenticated": ws_authenticated,
+            "subscribed_channels": runtime.get("ws_subscribed_channels") or [],
+            "subscription_errors": ws_errors[-5:],
+        },
         "risk": {"blocked": risk_blocked, "reason": risk_reason},
         "config": {
             "max_positions": 3,

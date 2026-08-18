@@ -70,6 +70,57 @@ class ActivePipelineTests(unittest.TestCase):
         self.assertTrue(all(e["signal_type"] == "smart_money_signal" for e in events))
         self.assertNotEqual(events[0]["txHash"], events[1]["txHash"])
 
+    def test_ws_parses_v6_signal_fields_from_arg(self):
+        ws = okx_dex_ws.OkxDexWs(channels=[okx_dex_ws.SIGNAL_CHANNEL], chain_indexes=["501"])
+        ws._connected = True
+        ws._logged_in = True
+        ws._on_message(None, {
+            "arg": {
+                "channel": okx_dex_ws.SIGNAL_CHANNEL,
+                "chainIndex": "501",
+                "timestamp": "1700000000000",
+                "token": {
+                    "tokenAddress": "TokenCA",
+                    "symbol": "T",
+                    "marketCapUsd": "45000",
+                },
+                "price": "1.25",
+                "walletType": "1,2",
+                "triggerWalletCount": "2",
+                "triggerWalletAddress": "wallet-a,wallet-b",
+                "amountUsd": "128000.00",
+                "soldRatioPercentage": "0",
+            },
+        })
+        events = ws.get_events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["signal_type"], "smart_money_signal")
+        self.assertEqual(events[0]["chainIndex"], "501")
+        self.assertEqual(events[0]["tokenContractAddress"], "TokenCA")
+
+    def test_ws_is_not_ready_until_v6_entry_subscription_succeeds(self):
+        ws = okx_dex_ws.OkxDexWs(channels=[okx_dex_ws.SIGNAL_CHANNEL], chain_indexes=["501"])
+        ws._connected = True
+        ws._logged_in = True
+        self.assertTrue(ws.is_authenticated)
+        self.assertFalse(ws.is_ready)
+        ws._on_message(None, {
+            "event": "error",
+            "code": "60029",
+            "msg": "Only users who are in the whitelist are allowed to subscribe to this channel.",
+        })
+        self.assertFalse(ws.is_ready)
+        self.assertEqual(ws.feed_status, "authenticated_no_entry_subscription")
+        ws._on_message(None, {
+            "event": "subscribe",
+            "arg": {
+                "channel": okx_dex_ws.SIGNAL_CHANNEL,
+                "chainIndex": "501",
+            },
+        })
+        self.assertTrue(ws.is_ready)
+        self.assertEqual(ws.subscribed_channels, [okx_dex_ws.SIGNAL_CHANNEL])
+
     def test_trade_time_accepts_seconds_and_milliseconds(self):
         self.assertEqual(monitor.trade_time_ms(1_700_000_000), 1_700_000_000_000)
         self.assertEqual(monitor.trade_time_ms(1_700_000_000_000), 1_700_000_000_000)
@@ -146,6 +197,31 @@ class ActivePipelineTests(unittest.TestCase):
 
             monitor.oc_run = fail_if_called
             self.assertEqual(monitor.fetch_tracker({}), [])
+        finally:
+            monitor._WS_CLIENT = original_ws
+            monitor.oc_run = original_oc_run
+
+    def test_authenticated_ws_without_entry_subscription_uses_rest_fallback(self):
+        class AuthenticatedWithoutFeedWs:
+            is_authenticated = True
+            is_ready = False
+
+            def get_events(self):
+                return []
+
+        original_ws = monitor._WS_CLIENT
+        original_oc_run = monitor.oc_run
+        try:
+            monitor._WS_CLIENT = AuthenticatedWithoutFeedWs()
+            calls = []
+
+            def fake_oc_run(args, timeout=None):
+                calls.append(args)
+                return '{"ok": true, "data": {"trades": []}}', 0
+
+            monitor.oc_run = fake_oc_run
+            self.assertEqual(monitor.fetch_tracker({}), [])
+            self.assertEqual(len(calls), 2)
         finally:
             monitor._WS_CLIENT = original_ws
             monitor.oc_run = original_oc_run
